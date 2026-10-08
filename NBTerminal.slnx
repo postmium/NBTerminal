@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="NBTerminal.Example/NBTerminal.Example.csproj" />
+  <Project Path="NBTerminal/NBTerminal.csproj" />
+</Solution>
