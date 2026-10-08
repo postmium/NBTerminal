@@ -11,10 +11,7 @@
 		<Title>NBTerminal</Title>
 		<Authors>postmium</Authors>
 
-		<Description>
-			A lightweight, event-driven .NET terminal library with
-			non-blocking input, independent rendering, and page management.
-		</Description>
+		<Description>A lightweight, event-driven .NET terminal library with non-blocking input, independent rendering, and page management.</Description>
 
 		<PackageTags>terminal;console;non-blocking;event-driven;rendering</PackageTags>
 

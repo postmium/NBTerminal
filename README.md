@@ -95,4 +95,4 @@ Bug reports, suggestions, and pull requests are welcome. You can open an issue o
 
 ## License
 
-NBTerminal is released under the [MIT License](LICENSE).
+NBTerminal is released under the [MIT License](LICENSE.txt).

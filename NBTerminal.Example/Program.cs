@@ -43,7 +43,7 @@ counterPage.InputReadKey += key =>
 
 textPage.InputReadLine += text =>
 {
-    Volatile.Write(ref lastText, text);
+    lastText = text;
 };
 
 Terminal.Output += frame =>
