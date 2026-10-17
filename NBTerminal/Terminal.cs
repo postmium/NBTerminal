@@ -1,310 +1,1578 @@
-﻿namespace NBTerminal;
+﻿using System.Buffers;
+using System.Buffers.Text;
+using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
+using System.Text;
 
+namespace NBTerminal;
+
+/// <summary>
+/// Организует событийный ввод, сборку кадров и неблокирующее обновление консольного интерфейса.
+/// </summary>
+/// <remarks>
+/// <para>
+/// После запуска работает одна фоновая задача. Она последовательно обрабатывает ввод, состояние рендера и вывод; это не
+/// выполнение обработчиков в вызывающем методе Main.
+/// </para>
+/// <para>
+/// Полная потокобезопасность не гарантируется. Управление запуском и ожиданием следует выполнять из одного управляющего
+/// участка кода. Из обработчиков можно запросить остановку через <see cref="Stop"/>, но нельзя синхронно ждать
+/// завершения выполняющей их задачи.
+/// </para>
+/// <para>
+/// Обычная ошибка обработчика направляется в событие ошибок своей подсистемы. Исключение из такого события доходит до
+/// главного цикла и завершает его. Обработчики событий должны завершать работу синхронно; их асинхронные продолжения
+/// эта реализация не ожидает.
+/// </para>
+/// <para>
+/// Рендер читает готовые ячейки и формирует команду отрисовки: общую последовательность управляющих байтов и символов
+/// UTF-8. Пока рендер управляет экраном, другой вывод в ту же консоль с ним не координируется.
+/// </para>
+/// <para>
+/// После отключения вывода восстановление экрана выполняется главным циклом, а не непосредственно в присваивании
+/// свойства. В режиме только ввода библиотека сама экран не захватывает.
+/// </para>
+/// </remarks>
 public static class Terminal
 {
+    //0. Ядро: фоновый цикл, разрешения подсистем и запуск/остановка.
+
+    #region Core
+
+    //Флаг продолжения работы. Его сброс запрашивает остановку, но не ждёт восстановления экрана.
+    private static volatile bool _enabled = false;
+
+    /// <summary>
+    /// Показывает, разрешено ли главному циклу продолжать работу.
+    /// </summary>
+    /// <value>
+    /// <see langword="true"/> после запуска и до запроса остановки либо завершения цикла.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Значение <see langword="false"/> не означает, что восстановление экрана уже завершено. Для ожидания используйте
+    /// <see cref="Wait"/> или <see cref="WaitAsync"/>.
+    /// </para>
+    /// </remarks>
+    public static bool Enabled => _enabled;
+
+    //Ввод и вывод разрешаются отдельно; ни один из этих флагов сам не запускает главный цикл.
+    //Разрешение опроса клавиатуры.
     private static volatile bool _inputEnabled = false;
+
+    //Разрешение сборки кадров и управления экраном.
     private static volatile bool _outputEnabled = false;
 
-    public static bool InputEnabled => _inputEnabled;
-    public static bool OutputEnabled => _outputEnabled;
-    public static bool Enabled => _inputEnabled || _outputEnabled;
-
-    private static volatile Exception? _lastError;
-    public static Exception? LastError => _lastError;
-
-    private static readonly Dictionary<string, Page> _pages = [];
-    private static volatile string? _selectedPage;
-    public static IReadOnlyDictionary<string, Page> Pages => _pages;
-    public static string? CurrentPage => _selectedPage;
-
-    public static bool RegisterPage(string name)
+    /// <summary>
+    /// Разрешает или приостанавливает опрос клавиатуры.
+    /// </summary>
+    /// <value>
+    /// По умолчанию <see langword="false"/>; запуск терминала сам по себе не включает ввод.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Переключение не очищает накопленные строки и не сбрасывает последние прочитанные символы. Во время обработки
+    /// текущей клавиши часть действий может уже выполняться.
+    /// </para>
+    /// <para>
+    /// При перехваченной ошибке чтения консоли свойство устанавливается в <see langword="false"/>. Повторное включение
+    /// выполняет вызывающий код.
+    /// </para>
+    /// </remarks>
+    public static bool InputEnabled
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(name);
-
-        if (!_pages.TryAdd(name, new Page())) return false;
-
-        _selectedPage ??= name;
-        return true;
-    }
-    public static bool SelectPage(string name)
-    {
-        if (!_pages.ContainsKey(name)) return false;
-
-        _selectedPage = name;
-        return true;
+        get => _inputEnabled;
+        set => _inputEnabled = value;
     }
 
-    private static ConsoleKeyInfo? _inputKeyInfo;
-    private static char? _inputChar;
-    private static volatile string _inputString = string.Empty;
-    public static ConsoleKeyInfo? InputKeyInfo => _inputKeyInfo;
-    public static char? InputChar => _inputChar;
-    public static string InputString => _inputString;
-
-    public static event Action<ConsoleKeyInfo>? InputReadKey;
-    public static event Action<char>? InputRead;
-    public static event Action<string>? InputReadLine;
-    public static event Action<Frame>? Output;
-    public static event Action<Exception>? Error;
-
-    private static string[] _previousFrame = [];
-    private static int _previousWidth;
-    private static int _previousHeight;
-
-    private static void DrawFrame(string content)
+    /// <summary>
+    /// Разрешает сборку и отображение кадров либо запрашивает остановку рендера.
+    /// </summary>
+    /// <value>
+    /// По умолчанию <see langword="false"/>; не зависит от разрешения ввода.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Изменение флага не выполняет команды терминала немедленно. Главный цикл отдельно запускает или завершает рендер
+    /// через UpdateRenderState.
+    /// </para>
+    /// <para>
+    /// При возобновлении рендер теряет предыдущий кадр и начинает с полной перерисовки. Ошибка самого рендера отключает
+    /// вывод; ошибка обычного обработчика Output пропускает только текущий кадр.
+    /// </para>
+    /// <para>
+    /// Во время активного рендера нельзя рассчитывать на корректное совмещение изображения с Console.Write. Одного
+    /// присваивания <see langword="false"/> недостаточно, чтобы синхронно дождаться восстановления консоли.
+    /// </para>
+    /// </remarks>
+    public static bool OutputEnabled
     {
-        int width = Console.WindowWidth;
-        int height = Console.WindowHeight;
-
-        if (width <= 0 || height <= 0) return;
-
-        if (width != _previousWidth || height != _previousHeight)
-        {
-            Console.Clear();
-
-            _previousFrame = [];
-            _previousWidth = width;
-            _previousHeight = height;
-        }
-
-        string[] lines = content
-            .Replace("\r\n", "\n")
-            .Replace('\r', '\n')
-            .Split('\n');
-
-        string[] currentFrame = new string[height];
-
-        for (int y = 0; y < height; y++)
-        {
-            int maxWidth = width - (y == height - 1 ? 1 : 0);
-
-            string current = y < lines.Length ? lines[y] : "";
-            string previous = y < _previousFrame.Length ? _previousFrame[y] : "";
-
-            if (current.Length > maxWidth) current = current[..maxWidth];
-
-            currentFrame[y] = current;
-
-            if (current == previous) continue;
-
-            Console.SetCursorPosition(0, y);
-            Console.Write(current);
-
-            if (current.Length < previous.Length)
-            {
-                Console.Write(new string(' ', previous.Length - current.Length));
-            }
-        }
-
-        _previousFrame = currentFrame;
+        get => _outputEnabled;
+        set => _outputEnabled = value;
     }
 
-    private static Task? _inputTask;
-    private static Task? _outputTask;
+    //Задача последнего запуска и доступ к её состоянию.
+    //Задача сохраняется и после завершения; до первого запуска равна null.
+    private static Task? _mainTask;
 
-    private static async Task InputLoop()
+    /// <summary>
+    /// Возвращает задачу последнего запущенного главного цикла.
+    /// </summary>
+    /// <value>
+    /// <see langword="null"/> до первого запуска; после остановки ссылка на завершённую задачу сохраняется.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Прямое ожидание этой задачи может передать её исключение вызывающему коду. Методы <see cref="Wait"/> и
+    /// <see cref="WaitAsync"/> такие исключения перехватывают.
+    /// </para>
+    /// </remarks>
+    public static Task? MainTask => _mainTask;
+
+    /// <summary>
+    /// Возвращает сохранённую фатальную ошибку главного цикла.
+    /// </summary>
+    /// <value>
+    /// Исключение или <see langword="null"/>; очищается при новом фактическом запуске.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Ошибка из обработчика InputError, OutputError или RenderError считается фатальной. Обычные ошибки подсистем
+    /// сохраняются в соответствующих свойствах и не обязаны заполнять это свойство.
+    /// </para>
+    /// <para>
+    /// Если при завершении уже имеется фатальная ошибка, новая ошибка обработчика RenderError её не заменяет.
+    /// </para>
+    /// </remarks>
+    public static Exception? MainException { get; private set; }
+
+    /// <summary>
+    /// Выполняет последовательные итерации ввода, управления рендером и вывода.
+    /// </summary>
+    /// <returns>
+    /// Задача главного цикла, включая попытку завершить рендер.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Между итерациями запрашивается задержка 10 мс; время обработчиков и вывода добавляется к ней.
+    /// </para>
+    /// <para>
+    /// Необработанное исключение сохраняется в MainException и переводит задачу в ошибочное состояние. Восстановление
+    /// рендера выполняется и при обычной остановке, и при таком исключении.
+    /// </para>
+    /// </remarks>
+    private static async Task MainLoop()
     {
         try
         {
-            while (_inputEnabled)
+            //Следующая итерация начинается, только пока не запрошена остановка.
+            while (_enabled)
             {
-                while (_inputEnabled)
-                {
-                    ConsoleKeyInfo key;
+                //Сначала разбираем доступные клавиши и вызываем их обработчики.
+                if (InputEnabled) ProcessInput();
 
-                    try
-                    {
-                        if (!Console.KeyAvailable) break;
+                //Stop() из обработчика ввода не должен запускать новую сборку кадра в этой итерации.
+                if (!_enabled) break;
 
-                        key = Console.ReadKey(true);
-                    }
-                    catch (IOException ex)
-                    {
-                        OnError(ex);
-                        break;
-                    }
-                    catch (InvalidOperationException ex)
-                    {
-                        OnError(ex);
-                        throw;
-                    }
+                //Смена OutputEnabled становится реальным запуском или остановкой рендера здесь.
+                UpdateRenderState();
 
-                    string? selectedPage = _selectedPage;
-                    Page? page = null;
-                    if (selectedPage is not null) _pages.TryGetValue(selectedPage, out page);
+                //Не собираем кадр, если вывод выключен или его инициализация не состоялась.
+                if (_enabled && OutputEnabled && _renderInitialized)
+                    ProcessOutput();
 
-                    try
-                    {
-                        _inputKeyInfo = key;
-
-                        InputReadKey?.Invoke(key);
-                        page?.OnInputReadKey(key);
-
-                        if (key.Key == ConsoleKey.Enter)
-                        {
-                            string line = _inputString;
-                            _inputString = string.Empty;
-
-                            InputReadLine?.Invoke(line);
-                            page?.OnInputReadLine();
-                        }
-                        else if (key.Key == ConsoleKey.Backspace)
-                        {
-                            if (_inputString.Length > 0) _inputString = _inputString[..^1];
-                            page?.OnBackspace();
-                        }
-                        else if (!char.IsControl(key.KeyChar))
-                        {
-                            _inputChar = key.KeyChar;
-                            _inputString += key.KeyChar;
-
-                            InputRead?.Invoke(key.KeyChar);
-                            page?.OnInputRead(key.KeyChar);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        OnError(ex);
-                        throw;
-                    }
-                }
-
-                if (_inputEnabled) await Task.Delay(10);
-            }
-        }
-        finally
-        {
-            _inputEnabled = false;
-        }
-    }
-    private static async Task OutputLoop()
-    {
-        Frame frame = new();
-        bool previousCursorVisible = true;
-
-        try
-        {
-            if (OperatingSystem.IsWindows()) previousCursorVisible = Console.CursorVisible;
-            Console.CursorVisible = false;
-
-            while (_outputEnabled)
-            {
-                frame.Clear();
-
-                try
-                {
-                    Output?.Invoke(frame);
-
-                    string? selectedPage = _selectedPage;
-                    if (selectedPage is not null && _pages.TryGetValue(selectedPage, out Page? page))
-                    {
-                        page.OnOutput(frame);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    OnError(ex);
-                    throw;
-                }
-
-                try
-                {
-                    DrawFrame(frame.ToString());
-                }
-                catch (ArgumentOutOfRangeException ex)
-                {
-                    _previousFrame = [];
-                    _previousWidth = 0;
-                    _previousHeight = 0;
-
-                    OnError(ex);
-                }
-                catch (IOException ex)
-                {
-                    OnError(ex);
-                    throw;
-                }
-                catch (InvalidOperationException ex)
-                {
-                    OnError(ex);
-                    throw;
-                }
-
+                //Даём задаче паузу; это не фиксированная частота кадров, работа выше занимает своё время.
                 await Task.Delay(10);
             }
         }
+        catch (Exception ex)
+        {
+            //Ошибка, не обработанная подсистемой, завершает задачу. Методы Wait подавят её повторную передачу.
+            MainException = ex;
+            throw;
+        }
         finally
         {
+            //Главный цикл больше не работает; восстановление рендера ниже ещё может занять время.
+            _enabled = false;
+
             try
             {
-                Console.CursorVisible = previousCursorVisible;
+                //Завершаем рендер и после обычного Stop(), и после фатальной ошибки.
+                StopRender();
             }
-            finally
+            catch (Exception ex)
             {
-                _outputEnabled = false;
+                try
+                {
+                    //Ошибка восстановления относится к рендеру, а не заменяет причину завершения цикла.
+                    OnRenderError(ex);
+                }
+                catch (Exception fatal)
+                {
+                    //Если ошибся сам RenderError, сохраняем эту ошибку только при отсутствии прежней фатальной.
+                    MainException ??= fatal;
+                }
             }
         }
     }
 
+    //Управление жизненным циклом из вызывающего кода, обычно из Main().
+    //Синхронные методы: запуск, запрос остановки и отдельное ожидание.
+    /// <summary>
+    /// Запускает главный цикл в фоновой задаче, не ожидая его завершения.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Если цикл уже включён, метод ничего не делает. Перед новым запуском очищает свойства исключений и фиксирует
+    /// настройку альтернативного экрана.
+    /// </para>
+    /// <para>
+    /// Флаги <see cref="InputEnabled"/> и <see cref="OutputEnabled"/> не меняются. Их нужно установить отдельно.
+    /// Подписки на события, страницы и накопленный ввод сохраняются.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// Предыдущий цикл уже получил запрос остановки, но его задача ещё не завершилась.
+    /// </exception>
     public static void Start()
     {
-        StartInput();
-        StartOutput();
+        //Повторный Start() при работающем цикле ничего не меняет.
+        if (_enabled) return;
+
+        //После Stop() задача может ещё восстанавливать экран; новый запуск пока запрещён.
+        if (_mainTask is { IsCompleted: false }) throw new InvalidOperationException("Предыдущий главный цикл ещё не завершился.");
+
+        //Новый запуск начинает историю ошибок заново, не сбрасывая страницы и накопленный ввод.
+        MainException = null;
+        InputException = null;
+        OutputException = null;
+        RenderException = null;
+
+        //Настройка экрана фиксируется на весь запуск, даже если OutputEnabled будет переключаться.
+        _alternateScreenActive = _useAlternateScreen;
+
+        _enabled = true;
+
+        _mainTask = Task.Run(MainLoop);
     }
-    public static void StopRequest()
+
+    /// <summary>
+    /// Запрашивает остановку главного цикла, не ожидая её завершения.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Метод только сбрасывает флаг продолжения работы. Текущий обработчик не прерывается, а восстановление экрана
+    /// выполняется главным циклом.
+    /// </para>
+    /// <para>
+    /// Разрешено вызывать из обработчиков событий. Дожидаться фактической остановки следует из управляющего кода через
+    /// <see cref="Wait"/> или <see cref="WaitAsync"/>.
+    /// </para>
+    /// </remarks>
+    public static void Stop()
     {
-        StopInputRequest();
-        StopOutputRequest();
+        //Только запрос остановки: текущий обработчик продолжит выполнение.
+        _enabled = false;
     }
+
+    /// <summary>
+    /// Синхронно ожидает завершения последней задачи терминала.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Не запрашивает остановку. До первого запуска сразу возвращается. Исключение ожидаемой задачи перехватывается;
+    /// сведения о фатальной ошибке доступны через <see cref="MainException"/>.
+    /// </para>
+    /// <para>
+    /// Нельзя вызывать из синхронно выполняемого обработчика терминала: задача не сможет завершиться, пока обработчик
+    /// ждёт её завершения.
+    /// </para>
+    /// </remarks>
+    public static void Wait()
+    {
+        if (_mainTask == null) return;
+
+        try
+        {
+            _mainTask.GetAwaiter().GetResult();
+        }
+        catch
+        {
+            //Исключение задачи уже сохранено в MainException; вызывающему коду его не передаём.
+        }
+    }
+
+    //Асинхронные варианты: ожидание не блокирует вызывающий поток.
+    /// <summary>
+    /// При необходимости ожидает предыдущую остановку и запускает новый главный цикл.
+    /// </summary>
+    /// <returns>
+    /// Задача операции запуска, а не задача всего времени работы терминала.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Если терминал уже включён, метод сразу возвращается. Если предыдущая задача ещё завершается, сначала ожидает её,
+    /// подавляя её исключение.
+    /// </para>
+    /// <para>
+    /// Перед запуском очищает свойства ошибок и фиксирует настройку альтернативного экрана. Не включает ввод и вывод
+    /// автоматически. Ожидание всей работы выполняется отдельно через <see cref="WaitAsync"/>.
+    /// </para>
+    /// </remarks>
+    public static async Task StartAsync()
+    {
+        //Работающий цикл повторно не запускаем.
+        if (_enabled) return;
+
+        //В отличие от Start(), дожидаемся ещё не завершившейся предыдущей задачи.
+        if (_mainTask is { IsCompleted: false })
+        {
+            try
+            {
+                //Ожидаем завершения всей старой задачи, включая её finally.
+                await _mainTask;
+            }
+            catch
+            {
+                //Ошибка предыдущей задачи не мешает новому запуску.
+            }
+        }
+
+        //Очищаем историю исключений непосредственно перед новым запуском.
+        MainException = null;
+        InputException = null;
+        OutputException = null;
+        RenderException = null;
+
+        //Берём настройку экрана для этого запуска; дальнейшие изменения свойства пока не применяются.
+        _alternateScreenActive = _useAlternateScreen;
+
+        _enabled = true;
+
+        _mainTask = Task.Run(MainLoop);
+    }
+
+    /// <summary>
+    /// Запрашивает остановку и асинхронно ожидает завершения последней задачи терминала.
+    /// </summary>
+    /// <returns>
+    /// Задача ожидания остановки; исключение главного цикла наружу не передаётся.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Вызывайте из управляющего кода. Из синхронных обработчиков используйте <see cref="Stop"/> без ожидания: ожидание
+    /// собственной задачи приведёт к взаимной блокировке.
+    /// </para>
+    /// </remarks>
     public static async Task StopAsync()
     {
-        StopRequest();
-        await Task.WhenAll(_inputTask ?? Task.CompletedTask, _outputTask ?? Task.CompletedTask);
+        //Сначала просим цикл остановиться, затем отдельно ждём его завершения.
+        Stop();
+
+        //Не ждите эту операцию внутри синхронного обработчика: он выполняется той самой задачей.
+        if (_mainTask != null)
+        {
+            try
+            {
+                //Ждём окончания главного цикла и попытки восстановления консоли.
+                await _mainTask;
+            }
+            catch
+            {
+                //Ошибка доступна через MainException, а StopAsync её повторно не выбрасывает.
+            }
+        }
     }
 
-    public static void StartInput()
+    /// <summary>
+    /// Асинхронно ожидает завершения последней задачи, не запрашивая остановку.
+    /// </summary>
+    /// <returns>
+    /// Задача ожидания; до первого запуска завершается сразу.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Исключение главного цикла перехватывается и не передаётся через эту задачу ожидания. Проверяйте
+    /// <see cref="MainException"/>. Не блокируйте обработчик терминала ожиданием этой операции.
+    /// </para>
+    /// </remarks>
+    public static async Task WaitAsync()
     {
-        if (_inputEnabled) return;
-        if (_inputTask is { IsCompleted: false }) throw new InvalidOperationException("Previous InputLoop has not yet completed");
+        if (_mainTask == null) return;
 
-        _inputEnabled = true;
-        _inputTask = Task.Run(InputLoop);
-    }
-    public static void StopInputRequest()
-    {
-        _inputEnabled = false;
-    }
-    public static async Task StopInputAsync()
-    {
-        StopInputRequest();
-        await Task.WhenAll(_inputTask ?? Task.CompletedTask);
-    }
-
-    public static void StartOutput()
-    {
-        if (_outputEnabled) return;
-        if (_outputTask is { IsCompleted: false }) throw new InvalidOperationException("Previous OutputLoop has not yet completed");
-
-        _outputEnabled = true;
-
-        _previousFrame = [];
-        _previousWidth = 0;
-        _previousHeight = 0;
-        _outputTask = Task.Run(OutputLoop);
-    }
-    public static void StopOutputRequest()
-    {
-        _outputEnabled = false;
-    }
-    public static async Task StopOutputAsync()
-    {
-        StopOutputRequest();
-        await Task.WhenAll(_outputTask ?? Task.CompletedTask);
+        try
+        {
+            await _mainTask;
+        }
+        catch
+        {
+            //Задача могла завершиться с ошибкой, но этот метод оставляет её в MainException.
+        }
     }
 
-    private static void OnError(Exception ex)
+    #endregion
+
+    //1.1. Ввод: чтение клавиш, накопление строк и передача событий.
+
+    #region Input
+
+    /// <summary>
+    /// Возвращает последнюю зарегистрированную ошибку чтения или обработки ввода.
+    /// </summary>
+    /// <value>
+    /// Исключение или <see langword="null"/>; очищается при новом фактическом запуске.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Ошибка обычного обработчика не выключает ввод. Перехваченные IOException и InvalidOperationException от чтения
+    /// консоли отключают InputEnabled до повторного включения.
+    /// </para>
+    /// </remarks>
+    public static Exception? InputException { get; private set; }
+
+    //Последние значения ввода. Строка здесь общая, независимо от буферов отдельных страниц.
+    //Последняя обработанная клавиша, включая служебные клавиши.
+    private static ConsoleKeyInfo? _inputKeyInfo;
+
+    //Последний обычный символ; Enter и Backspace его не сбрасывают.
+    private static char? _inputChar;
+
+    //Общий накопитель строки, не привязанный к выбранной странице.
+    private static volatile string _inputString = string.Empty;
+
+    /// <summary>
+    /// Возвращает последнюю клавишу, переданную на обработку.
+    /// </summary>
+    /// <value>
+    /// Сведения о клавише или <see langword="null"/> до первого присваивания.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Обновляется до глобального события InputReadKey. Enter и Backspace тоже сохраняются здесь; новый запуск значение
+    /// не очищает.
+    /// </para>
+    /// </remarks>
+    public static ConsoleKeyInfo? InputKeyInfo => _inputKeyInfo;
+
+    /// <summary>
+    /// Возвращает последний принятый неуправляющий символ.
+    /// </summary>
+    /// <value>
+    /// Символ или <see langword="null"/> до его первого приёма.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Enter и Backspace не очищают это значение. Обновление происходит только если выполнение дошло до ветви обычного
+    /// символа.
+    /// </para>
+    /// </remarks>
+    public static char? InputChar => _inputChar;
+
+    /// <summary>
+    /// Возвращает общую незавершённую строку ввода терминала.
+    /// </summary>
+    /// <value>
+    /// Накопленные символы без завершающего Enter.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Перед InputReadLine строка сохраняется для аргумента события, а это свойство очищается. Backspace удаляет
+    /// последнюю кодовую единицу char, если строка не пуста.
+    /// </para>
+    /// <para>
+    /// Глобальная строка не разделяется по страницам и не сбрасывается при переключении страницы или новом запуске. У
+    /// каждой страницы дополнительно есть собственная строка.
+    /// </para>
+    /// </remarks>
+    public static string InputString => _inputString;
+
+    //Сначала вызываются глобальные события, затем события выбранной для клавиши страницы.
+    /// <summary>
+    /// Возникает после чтения клавиши и сохранения её в InputKeyInfo.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Аргумент содержит клавишу, её символ и модификаторы. Событие вызывается до события ранее выбранной страницы и до
+    /// обработки Enter, Backspace или обычного символа.
+    /// </para>
+    /// <para>
+    /// Страница для этой клавиши выбрана до вызова события: переключение страницы здесь не перенаправляет уже
+    /// прочитанную клавишу. Исключение прекращает дальнейшую обработку этой клавиши и направляется в InputError.
+    /// </para>
+    /// </remarks>
+    public static event Action<ConsoleKeyInfo>? InputReadKey;
+
+    /// <summary>
+    /// Возникает после добавления обычного символа в общий буфер ввода.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Аргумент — прочитанный char. Событие вызывается после обновления InputChar и InputString, но до передачи символа
+    /// странице. Исключение направляется в InputError; уже выполненные изменения не откатываются.
+    /// </para>
+    /// </remarks>
+    public static event Action<char>? InputRead;
+
+    /// <summary>
+    /// Возникает при Enter и передаёт завершённую общую строку.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Аргумент — строка до очистки InputString, без Enter. Вызывается до события строки выбранной страницы. При
+    /// исключении последующие действия этой клавиши не выполняются, а ошибка направляется в InputError.
+    /// </para>
+    /// </remarks>
+    public static event Action<string>? InputReadLine;
+
+    /// <summary>
+    /// Возникает после сохранения ошибки в InputException.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Аргумент — зарегистрированное исключение. Если обработчики завершились без ошибок, цикл продолжает работу; при
+    /// ошибке чтения флаг ввода уже выключен.
+    /// </para>
+    /// <para>
+    /// Исключение из самого InputError не перехватывается этим событием повторно: оно завершает главный цикл и попадает
+    /// в MainException. Последующие подписчики этого вызова не выполняются.
+    /// </para>
+    /// </remarks>
+    public static event Action<Exception>? InputError;
+
+    /// <summary>
+    /// Считывает доступные клавиши и последовательно вызывает глобальные и страничные обработчики.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Чтение консоли и пользовательские обработчики находятся в разных блоках try. Поэтому ошибка из события
+    /// InputError не попадает обратно в обработчик ошибки чтения и может дойти до MainLoop.
+    /// </para>
+    /// </remarks>
+    private static void ProcessInput()
     {
-        _lastError = ex;
-        Error?.Invoke(ex);
+        //Один проход выбирает доступные клавиши; при пустом вводе возвращаемся в главный цикл.
+        while (Enabled && InputEnabled)
+        {
+            ConsoleKeyInfo keyInfo;
+
+            try
+            {
+                //Не вызываем ReadKey без доступной клавиши, чтобы не ждать её здесь намеренно.
+                if (!Console.KeyAvailable) break;
+
+                //true запрещает автоматическое эхо символа: рисованием интерфейса управляет вывод.
+                keyInfo = Console.ReadKey(true);
+            }
+            catch (IOException ex)
+            {
+                //Отключаем недоступный источник ввода, чтобы не повторять одну ошибку каждую итерацию.
+                InputEnabled = false;
+                OnInputError(ex);
+                return;
+            }
+            catch (InvalidOperationException ex)
+            {
+                //Например, интерактивное чтение недоступно у перенаправленного стандартного ввода.
+                InputEnabled = false;
+                OnInputError(ex);
+                return;
+            }
+
+            //Фиксируем получателя этой клавиши до событий; переключение страницы внутри них его не заменит.
+            _pages.TryGetValue(_currentPage, out Page? page);
+
+            try
+            {
+                //Глобальный обработчик уже сможет прочитать эту клавишу через InputKeyInfo.
+                _inputKeyInfo = keyInfo;
+
+                //Исключение любого подписчика прервёт дальнейшую обработку именно этой клавиши.
+                InputReadKey?.Invoke(keyInfo);
+                page?.OnInputReadKey(keyInfo);
+
+                //Передаём снимок строки, а накопитель очищаем до уведомления подписчиков.
+                if (keyInfo.Key == ConsoleKey.Enter)
+                {
+                    string line = _inputString;
+                    _inputString = string.Empty;
+
+                    InputReadLine?.Invoke(line);
+                    page?.OnInputReadLine();
+                }
+                //Backspace удаляет последний char; это не возврат каретки и не разбор целой графемы.
+                else if (keyInfo.Key == ConsoleKey.Backspace)
+                {
+                    if (_inputString.Length > 0) _inputString = _inputString[..^1];
+                    page?.OnBackspace();
+                }
+                //Обычный символ сначала попадает в общий накопитель, затем передаётся странице.
+                else if (!char.IsControl(keyInfo.KeyChar))
+                {
+                    _inputChar = keyInfo.KeyChar;
+                    _inputString += keyInfo.KeyChar;
+
+                    InputRead?.Invoke(keyInfo.KeyChar);
+                    page?.OnInputRead(keyInfo.KeyChar);
+                }
+            }
+            catch (Exception ex)
+            {
+                //Пропускаем остаток обработки клавиши. Ошибка самого InputError уже выйдет в MainLoop.
+                OnInputError(ex);
+            }
+        }
     }
+
+    /// <summary>
+    /// Сохраняет ошибку ввода и уведомляет подписчиков InputError.
+    /// </summary>
+    /// <param name="ex">Ошибка чтения или пользовательской обработки ввода.</param>
+    /// <remarks>
+    /// <para>
+    /// Исключение из подписчика намеренно не подавляется: главный цикл должен зарегистрировать его как фатальное.
+    /// </para>
+    /// </remarks>
+    private static void OnInputError(Exception ex)
+    {
+        InputException = ex;
+        InputError?.Invoke(ex);
+    }
+
+    #endregion
+
+    //1.2. Вывод: размеры, два переиспользуемых кадра и цепочка их заполнения.
+
+    #region Output
+
+    /// <summary>
+    /// Возвращает последнюю ошибку получения размеров, подготовки кадра или обработчиков вывода.
+    /// </summary>
+    /// <value>
+    /// Исключение или <see langword="null"/>; очищается при новом фактическом запуске.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Ошибки формирования и отправки байтов рендера относятся к RenderException, а не к этому свойству.
+    /// </para>
+    /// </remarks>
+    public static Exception? OutputException { get; private set; }
+
+    //Глобальные события завершают сборку кадра и сообщают ошибки этой сборки.
+    /// <summary>
+    /// Возникает для дополнения кадра после обработчиков активной страницы.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Аргумент — тот же Frame, который уже заполняла страница. Методы кадра меняют его Cell[]; после события рендер
+    /// читает итоговое содержимое.
+    /// </para>
+    /// <para>
+    /// Кадр принадлежит двум переиспользуемым буферам терминала. Не изменяйте его после возврата из обработчика и не
+    /// считайте сохранённую ссылку независимым снимком.
+    /// </para>
+    /// <para>
+    /// Исключение любого подписчика прекращает этот вызов события, направляется в OutputError и пропускает отображение
+    /// текущего кадра. Следующая итерация может собрать кадр заново.
+    /// </para>
+    /// </remarks>
+    public static event Action<Frame>? Output;
+
+    /// <summary>
+    /// Возникает после сохранения ошибки сборки кадра в OutputException.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Аргумент — ошибка. Если обработчик не выбрасывает новое исключение, текущий кадр пропускается, а работа
+    /// продолжается. Исключение из OutputError завершает главный цикл и сохраняется в MainException.
+    /// </para>
+    /// </remarks>
+    public static event Action<Exception>? OutputError;
+
+    //Храним два объекта: один заполняется, другой может оставаться предыдущим кадром рендера.
+    //Слоты не меняются местами: переключается только индекс выбранного кадра.
+    private static readonly Frame?[] _frames = new Frame?[2];
+
+    //Индекс свободного слота для следующей сборки.
+    private static int _frameIndex = 0;
+
+    //Последнее измерение области вывода. -1 означает, что исходный размер ещё не запомнен.
+    //Неизвестная ширина до первого измерения.
+    private static int _lastWidth = -1;
+
+    //Неизвестная высота до первого измерения.
+    private static int _lastHeight = -1;
+
+    /// <summary>
+    /// Уведомляет об обнаруженном изменении размеров области вывода.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Первый аргумент — новая ширина в ячейках, второй — новая высота. Событие вызывается после события активной
+    /// страницы и до подготовки кадра и обработчиков Output.
+    /// </para>
+    /// <para>
+    /// Первое измерение после инициализации рендера не считается изменением. При выключенном выводе размеры не
+    /// опрашиваются. Неактивные страницы уведомление не получают.
+    /// </para>
+    /// <para>
+    /// Размеры сохраняются до вызова событий. Если обработчик выбрасывает исключение, ошибка направляется в
+    /// OutputError, но одно и то же изменение размеров специально повторно не уведомляется.
+    /// </para>
+    /// </remarks>
+    public static event Action<int, int>? OutputResized;
+
+    /// <summary>
+    /// Подготавливает свободный кадр, вызывает обработчики и передаёт результат рендеру.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// При неизменных размерах повторно использует один из двух кадров. Предыдущий успешно обработанный кадр остаётся
+    /// доступным для сравнения; индекс меняется только после успешного ProcessRender.
+    /// </para>
+    /// <para>
+    /// Ошибка подготовки направляется в OutputError и пропускает кадр. Ошибка рендера инвалидирует историю, отключает
+    /// вывод и направляется в RenderError. Исключения самих событий ошибок уходят в MainLoop.
+    /// </para>
+    /// </remarks>
+    private static void ProcessOutput()
+    {
+        Frame frame;
+
+        try
+        {
+            //Размеры считываются один раз для этой сборки и затем передаются вместе с кадром.
+            int width = Console.WindowWidth;
+            int height = Console.WindowHeight;
+
+            //Нулевую область не отображаем; прежнее изображение больше не используем для сравнения.
+            if (width <= 0 || height <= 0)
+            {
+                _oldFrame = null;
+                return;
+            }
+
+            //Первое измерение задаёт исходную точку и не считается событием изменения.
+            bool resized = _lastWidth >= 0 && (_lastWidth != width || _lastHeight != height);
+
+            //Запоминаем размеры до событий: ошибка подписчика не вызовет повтор того же уведомления.
+            _lastWidth = width;
+            _lastHeight = height;
+
+            //Сначала уведомляем активную страницу, затем глобальных подписчиков.
+            if (resized)
+            {
+                _pages.TryGetValue(_currentPage, out Page? resizedPage);
+
+                resizedPage?.OnOutputResized(width, height);
+                OutputResized?.Invoke(width, height);
+            }
+
+            //Берём слот, который не должен содержать текущий кадр сравнения.
+            Frame? current = _frames[_frameIndex];
+
+            //Новый массив нужен только для пустого слота или другого размера.
+            if (current == null || current.Width != width || current.Height != height)
+            {
+                current = new Frame(width, height);
+                _frames[_frameIndex] = current;
+            }
+            else
+            {
+                //Обнуляем свободный кадр и его виртуальный курсор, сохраняя массив ячеек.
+                current.Clear();
+            }
+
+            frame = current;
+
+            //Выбираем страницу заново: обработчик изменения размера мог переключить её.
+            _pages.TryGetValue(_currentPage, out Page? page);
+
+            page?.OnOutput(frame);
+            Output?.Invoke(frame);
+        }
+        catch (Exception ex)
+        {
+            //Не показываем частично собранный кадр. Тот же слот будет очищен перед следующей попыткой.
+            OnOutputError(ex);
+            return;
+        }
+
+        try
+        {
+            //На этом этапе ячейки уже не меняются: рендер только читает их и формирует байты.
+            ProcessRender(frame);
+
+            //Исключающее ИЛИ с 1 переключает индекс 0 ↔ 1. При ошибке индекс не меняется.
+            _frameIndex ^= 1;
+        }
+        catch (Exception ex)
+        {
+            //Часть байтов могла попасть в терминал, поэтому предыдущему изображению доверять нельзя.
+            _oldFrame = null;
+
+            //Ввод продолжит работу; главный цикл заметит отключение вывода и завершит рендер.
+            OutputEnabled = false;
+
+            //Ошибка RenderError здесь не перехватывается снова и дойдёт до главного цикла.
+            OnRenderError(ex);
+        }
+    }
+
+    /// <summary>
+    /// Сохраняет ошибку сборки кадра и вызывает OutputError.
+    /// </summary>
+    /// <param name="ex">Ошибка получения размеров, подготовки кадра или пользовательского обработчика.</param>
+    /// <remarks>
+    /// <para>
+    /// Здесь нет подавления исключений подписчиков: новое исключение должно завершить главный цикл.
+    /// </para>
+    /// </remarks>
+    private static void OnOutputError(Exception ex)
+    {
+        //Сохраняем ошибку до события, чтобы обработчик мог прочитать свойство.
+        OutputException = ex;
+        OutputError?.Invoke(ex);
+    }
+
+    #endregion
+
+    //1.3. Рендер: подготовка терминала, построение байтовой команды и отправка в поток.
+
+    #region Render
+
+    /// <summary>
+    /// Возвращает последнюю зарегистрированную ошибку инициализации, выполнения или завершения рендера.
+    /// </summary>
+    /// <value>
+    /// Исключение или <see langword="null"/>; очищается при новом фактическом запуске.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// При неудачной инициализации и последующей неудачной очистке может содержать AggregateException с обеими
+    /// ошибками.
+    /// </para>
+    /// </remarks>
+    public static Exception? RenderException { get; private set; }
+
+    /// <summary>
+    /// Возникает после сохранения ошибки рендера.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Аргумент — ошибка подсистемы рендера. После ошибки инициализации или отображения OutputEnabled выключается;
+    /// ошибка завершения также регистрируется этим событием.
+    /// </para>
+    /// <para>
+    /// Если обработчик выбрасывает исключение, оно становится фатальным для главного цикла. При уже выполняющемся
+    /// завершении исходная фатальная ошибка, если она есть, сохраняет приоритет.
+    /// </para>
+    /// </remarks>
+    public static event Action<Exception>? RenderError;
+
+    /// <summary>
+    /// Сохраняет ошибку рендера и вызывает RenderError.
+    /// </summary>
+    /// <param name="ex">Зарегистрированная ошибка рендера или объединённая ошибка инициализации и очистки.</param>
+    /// <remarks>
+    /// <para>
+    /// Исключения подписчиков не перехватываются здесь: за фатальное завершение отвечает главный цикл.
+    /// </para>
+    /// </remarks>
+    private static void OnRenderError(Exception ex)
+    {
+        //Запоминаем исходную ошибку до вызова пользовательских обработчиков.
+        RenderException = ex;
+
+        //Новое исключение подписчика намеренно выходит наружу как фатальное.
+        //Исключение подписчика не подавляется и может завершить MainLoop.
+        RenderError?.Invoke(ex);
+    }
+
+    //Кодировка до последнего StartRender; её пытаемся восстановить при завершении рендера.
+    private static Encoding? _oldOutputEncoding = null;
+
+    //Желаемая настройка для следующего Start(), а не состояние уже работающего экрана.
+    private static volatile bool _useAlternateScreen = true;
+
+    /// <summary>
+    /// Задаёт использование альтернативного экранного буфера при следующем запуске терминала.
+    /// </summary>
+    /// <value>
+    /// По умолчанию <see langword="true"/>. Это желаемая настройка, а не признак текущего состояния экрана.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// Значение фиксируется при фактическом Start или StartAsync. Изменение во время работы не переключает экран.
+    /// </para>
+    /// <para>
+    /// Выключение и повторное включение OutputEnabled в том же запуске продолжает использовать ранее зафиксированное
+    /// значение. Новая настройка применяется после остановки и нового запуска.
+    /// </para>
+    /// </remarks>
+    public static bool UseAlternateScreen
+    {
+        get => _useAlternateScreen;
+        set => _useAlternateScreen = value;
+    }
+
+    //Снимок настройки, сделанный при запуске главного цикла.
+    private static bool _alternateScreenActive = false;
+
+    //Отметка начала инициализации. Она может быть true и после частично неудачного запуска.
+    private static bool _renderInitialized = false;
+
+    //Ссылка для сравнения, а не отдельная копия массива предыдущего изображения.
+    private static Frame? _oldFrame = null;
+
+    //Открытый стандартный поток вывода (StdOut). Само открытие не отправляет команд.
+    private static readonly Stream _stdout = Console.OpenStandardOutput();
+
+    //Общий расширяемый буфер: управляющие последовательности и символы UTF-8 идут подряд.
+    private static readonly ArrayBufferWriter<byte> _renderBuffer = new();
+
+    /// <summary>
+    /// Начинает управление экраном: сохраняет кодировку, включает UTF-8 и скрывает курсор.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Если рендер уже помечен как инициализированный, ничего не делает. При необходимости добавляет переключение на
+    /// альтернативный экран, используя настройку текущего запуска.
+    /// </para>
+    /// <para>
+    /// Флаг инициализации устанавливается до смены кодировки и отправки команд, чтобы при частичной ошибке вызывающий
+    /// код мог попытаться выполнить StopRender. Отправка выполняется через FlushRender.
+    /// </para>
+    /// <para>
+    /// При каждом таком запуске сбрасывает историю изображения и последние измеренные размеры; следующий кадр будет
+    /// полным.
+    /// </para>
+    /// </remarks>
+    private static void StartRender()
+    {
+        //Повторный вызов не должен заново переключать уже выбранный экран.
+        if (_renderInitialized) return;
+
+        //До этой точки настройки консоли ещё не менялись.
+        _oldOutputEncoding = Console.OutputEncoding;
+
+        //Теперь при любой дальнейшей ошибке вызывающий код должен попытаться завершить рендер.
+        _renderInitialized = true;
+
+        //Новый сеанс рендера всегда начинает с полной перерисовки.
+        _oldFrame = null;
+
+        //Удаляем оставшиеся байты команды, сохраняя сам расширяемый буфер.
+        _renderBuffer.Clear();
+
+        //Первый кадр после включения вывода заново устанавливает исходные размеры.
+        _lastWidth = -1;
+        _lastHeight = -1;
+
+        //WriteCharacter создаёт UTF-8-байты, поэтому согласуем с ними кодировку консольного вывода.
+        Console.OutputEncoding = Encoding.UTF8;
+
+        //Пока только добавляем запрос переключения: экран изменится после отправки байтов.
+        if (_alternateScreenActive)
+            _renderBuffer.Write("\x1b[?1049h"u8);
+
+        //Команда скрывает видимый курсор; позиционирование для записи продолжит работать.
+        _renderBuffer.Write("\x1b[?25l"u8);
+
+        //Именно здесь ранее подготовленные байты передаются терминалу.
+        FlushRender();
+    }
+
+    /// <summary>
+    /// Пытается завершить управление экраном и восстановить сохранённую кодировку.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Отправляет сброс оформления, включение автопереноса и показ курсора; при необходимости возвращается с
+    /// альтернативного экрана на основной. Исходные видимость курсора и режим переноса не сохранялись: устанавливаются
+    /// именно эти обычные состояния.
+    /// </para>
+    /// <para>
+    /// Восстановление кодировки выполняется отдельной попыткой даже после ошибки записи завершающих команд. Если обе
+    /// попытки завершились ошибками, наружу передаётся первая из них.
+    /// </para>
+    /// <para>
+    /// Внутреннее состояние рендера сбрасывается перед передачей ошибки вызывающему коду. Сброс флагов не доказывает,
+    /// что физический терминал принял все команды.
+    /// </para>
+    /// </remarks>
+    private static void StopRender()
+    {
+        //Если управление экраном не начиналось, восстанавливать через этот метод нечего.
+        if (!_renderInitialized) return;
+
+        Exception? error = null;
+
+        try
+        {
+            //Не отправляем остаток повреждённого кадра вместе с завершающими командами.
+            _renderBuffer.Clear();
+
+            //Запрашиваем стандартное оформление и включённый перенос, а не сохранённые исходные режимы.
+            _renderBuffer.Write("\x1b[0m\x1b[?7h"u8);
+
+            //Возвращаем основной экран только если этот запуск запрашивал альтернативный.
+            if (_alternateScreenActive)
+                _renderBuffer.Write("\x1b[?1049l"u8);
+
+            //Показываем курсор независимо от того, был ли он видим до работы библиотеки.
+            _renderBuffer.Write("\x1b[?25h"u8);
+
+            //Пытаемся отправить пакет завершения; отказ потока не должен отменить восстановление кодировки.
+            FlushRender();
+        }
+        catch (Exception ex)
+        {
+            //Сохраняем первую ошибку для передачи после остальных попыток восстановления.
+            error = ex;
+        }
+
+        try
+        {
+            //Эта попытка выполняется отдельно от отправки команд и не зависит от её успеха.
+            if (_oldOutputEncoding != null)
+                Console.OutputEncoding = _oldOutputEncoding;
+        }
+        catch (Exception ex)
+        {
+            //Если уже была ошибка отправки, она остаётся основной; иначе запоминаем ошибку кодировки.
+            error ??= ex;
+        }
+        finally
+        {
+            //Освобождаем внутреннее состояние сеанса даже при неудачном восстановлении физического экрана.
+            _oldOutputEncoding = null;
+            _renderInitialized = false;
+            _oldFrame = null;
+            _renderBuffer.Clear();
+        }
+
+        //Повторно выбрасываем сохранённую ошибку с исходной трассировкой стека.
+        if (error != null)
+            ExceptionDispatchInfo.Capture(error).Throw();
+    }
+
+    /// <summary>
+    /// Согласует состояние рендера с флагом OutputEnabled.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// При включённом выводе запускает рендер, если это ещё не сделано. При выключенном выводе завершает активный
+    /// рендер.
+    /// </para>
+    /// <para>
+    /// Ошибка запуска отключает вывод и запускает попытку очистки; две ошибки объединяются в AggregateException. Ошибки
+    /// сообщаются через RenderError вне защищаемой операции, чтобы ошибка самого подписчика не была обработана
+    /// повторно.
+    /// </para>
+    /// </remarks>
+    private static void UpdateRenderState()
+    {
+        //Желаемое состояние вывода проверяется главным циклом, а не в сеттере свойства.
+        if (OutputEnabled)
+        {
+            if (_renderInitialized) return;
+
+            try
+            {
+                StartRender();
+            }
+            catch (Exception ex)
+            {
+                //Не запускаем неисправный рендер снова автоматически на каждой итерации.
+                OutputEnabled = false;
+
+                //StartRender мог успеть изменить часть настроек, прежде чем выбросить исключение.
+                Exception error = ex;
+
+                try
+                {
+                    StopRender();
+                }
+                catch (Exception stopEx)
+                {
+                    //Здесь сохраняем обе причины: отказ запуска и отказ последующей очистки.
+                    error = new AggregateException("Не удалось инициализировать и восстановить рендер.", ex, stopEx);
+                }
+
+                //Событие ошибок вызывается вне try запуска, чтобы его исключение не принять за ошибку запуска.
+                OnRenderError(error);
+            }
+        }
+        //Выключенный вывод освобождает экран; обработка клавиатуры от этого не прекращается.
+        else if (_renderInitialized)
+        {
+            try
+            {
+                StopRender();
+            }
+            catch (Exception ex)
+            {
+                OnRenderError(ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Формирует команду полного или построчного обновления и передаёт её в поток.
+    /// </summary>
+    /// <param name="frame">
+    /// Готовый кадр. Его ячейки только читаются, а сам объект после успеха сохраняется как предыдущий.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// При отсутствии предыдущего кадра или несовпадении размеров формирует весь кадр; иначе формирует только
+    /// изменившиеся строки. Прежняя ссылка при полном обновлении не нужна.
+    /// </para>
+    /// <para>
+    /// Служебные команды окружают данные кадра: автоперенос выключается на время записи, затем оформление сбрасывается
+    /// и перенос включается. Если изменённых строк нет, даже служебные байты не отправляются.
+    /// </para>
+    /// <para>
+    /// После успеха сохраняет ссылку на кадр, в том числе при пустой команде и совпавшем изображении. При ошибке
+    /// сбрасывает историю, пробует вернуть обычные режимы и повторно выбрасывает исходную ошибку.
+    /// </para>
+    /// </remarks>
+    private static void ProcessRender(Frame frame)
+    {
+        //Один кадр → одна подготовленная команда → отправка → новая ссылка для сравнения.
+
+        //Начинаем новый пакет. Массив ячеек Frame при этом не очищается.
+        _renderBuffer.Clear();
+
+        //Добавляем заголовок отключения автопереноса; до FlushRender терминал его ещё не получил.
+        _renderBuffer.Write("\x1b[?7l"u8);
+
+        //Если длина не вырастет, изменённых строк нет и даже заголовок отправлять незачем.
+        int headerLength = _renderBuffer.WrittenCount;
+
+        try
+        {
+            //История пригодна только для кадра того же размера.
+            if (_oldFrame == null || _oldFrame.Width != frame.Width || _oldFrame.Height != frame.Height)
+            {
+                //Отбрасываем лишь ссылку рендера, а не освобождаем два переиспользуемых кадра.
+                _oldFrame = null;
+
+                //Добавляем все строки, в том числе пустые ячейки, которые затрут старое изображение.
+                RenderFull(frame);
+            }
+            else
+            {
+                //Добавляем только строки, в которых различается хотя бы одна ячейка или её стиль.
+                RenderDiff(frame);
+            }
+
+            //Сравниваем длину с заголовком, чтобы отличить реальную отрисовку от отсутствия изменений.
+            if (_renderBuffer.WrittenCount > headerLength)
+            {
+                //Закрываем пакет сбросом стиля и включением автопереноса.
+                _renderBuffer.Write("\x1b[0m\x1b[?7h"u8);
+
+                //Одна операция отправки для всего сформированного пакета.
+                FlushRender();
+            }
+            else
+            {
+                //Команда содержит только заголовок; отбрасываем его без записи в поток.
+                _renderBuffer.Clear();
+            }
+
+            //Даже при пустом пакете новый кадр соответствует прежнему изображению и пригоден для сравнения.
+            _oldFrame = frame;
+        }
+        catch
+        {
+            //Ошибка не позволяет считать кадр отображённым: история сбрасывается.
+            _oldFrame = null;
+            _renderBuffer.Clear();
+
+            //Поток мог принять лишь часть пакета; пытаемся вернуть обычные режимы отдельной записью.
+            try
+            {
+                _stdout.Write("\x1b[0m\x1b[?7h"u8);
+                _stdout.Flush();
+            }
+            catch
+            {
+                //Не подменяем исходную ошибку новой ошибкой этой аварийной попытки.
+            }
+
+            throw;
+        }
+
+    }
+
+    /// <summary>
+    /// Добавляет в командный буфер все строки кадра.
+    /// </summary>
+    /// <param name="frame">Кадр для полной перерисовки.</param>
+    /// <remarks>
+    /// <para>
+    /// Не использует старый кадр, не меняет ячейки и не отправляет данные в поток. Каждая строка включает всю ширину,
+    /// поэтому пустые ячейки тоже будут перезаписаны.
+    /// </para>
+    /// </remarks>
+    private static void RenderFull(Frame frame)
+    {
+        //Используем тот же построитель строк, что и разностный рендер.
+        for (int y = 0; y < frame.Height; y++)
+            RenderLine(frame, y);
+    }
+
+    /// <summary>
+    /// Добавляет в командный буфер только строки, отличающиеся от предыдущего кадра.
+    /// </summary>
+    /// <param name="frame">Новый кадр для сравнения.</param>
+    /// <remarks>
+    /// <para>
+    /// Вызывающий ProcessRender уже проверяет совпадение размеров. Если предыдущая ссылка отсутствует, метод переходит
+    /// к полному формированию.
+    /// </para>
+    /// <para>
+    /// Сравнивает ячейки вместе со стилем. Достаточно одного отличия, чтобы добавить всю строку. Срезы буфера не
+    /// являются новыми массивами и не меняют исходные данные.
+    /// </para>
+    /// </remarks>
+    private static void RenderDiff(Frame frame)
+    {
+        //Защитный переход к полной команде при отсутствии истории.
+        if (_oldFrame == null)
+        {
+            RenderFull(frame);
+            return;
+        }
+
+        //Два представления только для чтения: старое изображение и новый кадр.
+        ReadOnlySpan<Cell> oldBuffer = _oldFrame.Buffer;
+        ReadOnlySpan<Cell> newBuffer = frame.Buffer;
+
+        //Срез строки — часть существующего массива, а не новый массив или объект string.
+        for (int y = 0; y < frame.Height; y++)
+        {
+            int offset = y * frame.Width;
+
+            ReadOnlySpan<Cell> oldLine = oldBuffer.Slice(offset, frame.Width);
+            ReadOnlySpan<Cell> newLine = newBuffer.Slice(offset, frame.Width);
+
+            //Сравнение учитывает весь Cell. Одного отличия достаточно для записи всей строки.
+            if (!oldLine.SequenceEqual(newLine))
+                RenderLine(frame, y);
+        }
+    }
+
+    /// <summary>
+    /// Отправляет накопленную команду в стандартный поток вывода.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// При пустом буфере ничего не делает. Иначе передаёт заполненный участок через Write, вызывает Flush и только
+    /// после этого очищает командный буфер.
+    /// </para>
+    /// <para>
+    /// Запись байтов не является подтверждением физического отображения. Если Write или Flush выбросит исключение,
+    /// очистка в этом методе не выполнится; ошибку обрабатывает вызывающий код.
+    /// </para>
+    /// </remarks>
+    private static void FlushRender()
+    {
+        //Пустой пакет не должен вызывать запись и Flush.
+        if (_renderBuffer.WrittenCount == 0) return;
+
+        //Передаём заполненный участок буфера без создания отдельного массива байтов.
+        _stdout.Write(_renderBuffer.WrittenSpan);
+        _stdout.Flush();
+
+        //До этой строки доходим только после успешных Write и Flush.
+        _renderBuffer.Clear();
+    }
+
+    /// <summary>
+    /// Добавляет позиционирование, оформление и символы одной полной строки кадра.
+    /// </summary>
+    /// <param name="frame">Источник ячеек, доступный только для чтения.</param>
+    /// <param name="y">Номер строки от нуля до высоты кадра минус один.</param>
+    /// <remarks>
+    /// <para>
+    /// Первое оформление устанавливается обязательно, даже если оно равно default. Затем команды оформления добавляются
+    /// только при смене Style внутри этой строки.
+    /// </para>
+    /// <para>
+    /// Метод не хранит физическую позицию курсора между строками: каждая начинается с явной команды позиционирования.
+    /// Данные отправляет не этот метод, а FlushRender.
+    /// </para>
+    /// </remarks>
+    private static void RenderLine(Frame frame, int y)
+    {
+        //Читаем ячейки напрямую; промежуточное текстовое представление кадра не требуется.
+        ReadOnlySpan<Cell> buffer = frame.Buffer;
+
+        //Каждую строку начинаем с явной позиции, не запоминая физический курсор между строками.
+        WriteCursor(0, y);
+
+        //Стиль известен только внутри формируемой строки; первая ячейка обязательно задаст его заново.
+        Style currentStyle = default;
+        bool styleInitialized = false;
+
+        //Обходим всю ширину, чтобы пробелы и пустые ячейки тоже стирали прежние символы.
+        for (int x = 0; x < frame.Width; x++)
+        {
+            Cell cell = buffer[y * frame.Width + x];
+
+            //Повторяющийся стиль не создаёт новых команд; изменившийся устанавливается полностью.
+            if (!styleInitialized || currentStyle != cell.Style)
+            {
+                WriteStyle(cell.Style);
+                currentStyle = cell.Style;
+                styleInitialized = true;
+            }
+
+            //После оформления добавляем UTF-8-байты символа в тот же пакет.
+            WriteCharacter(cell.Character);
+        }
+    }
+
+    /// <summary>
+    /// Добавляет десятичное представление числа в байтовую команду без промежуточной строки.
+    /// </summary>
+    /// <param name="value">Целое число, используемое как параметр управляющей команды.</param>
+    /// <exception cref="InvalidOperationException">Число не удалось записать во временный буфер.</exception>
+    private static void WriteNumber(int value)
+    {
+        //Для любого int достаточно 11 байтов: десять цифр и возможный минус.
+        Span<byte> buffer = stackalloc byte[11];
+
+        if (!Utf8Formatter.TryFormat(value, buffer, out int length))
+            throw new InvalidOperationException("Не удалось записать число.");
+
+        _renderBuffer.Write(buffer[..length]);
+    }
+
+    /// <summary>
+    /// Добавляет CSI-команду абсолютного позиционирования курсора.
+    /// </summary>
+    /// <param name="x">Номер столбца в системе координат кадра, начиная с нуля.</param>
+    /// <param name="y">Номер строки в системе координат кадра, начиная с нуля.</param>
+    /// <remarks>
+    /// <para>
+    /// Записывает ESC, символ [, номер строки плюс один, разделитель ;, номер столбца плюс один и H. Здесь формируются
+    /// байты, а не происходит немедленное перемещение. Координаты отдельно не проверяются.
+    /// </para>
+    /// </remarks>
+    private static void WriteCursor(int x, int y)
+    {
+        //CSI = ESC и [. Координаты команды начинаются с 1: сначала строка, затем столбец.
+        _renderBuffer.Write("\x1b["u8);
+        WriteNumber(y + 1);
+        _renderBuffer.Write(";"u8);
+        WriteNumber(x + 1);
+        _renderBuffer.Write("H"u8);
+    }
+
+    /// <summary>
+    /// Добавляет полный сброс оформления и установку переданного стиля.
+    /// </summary>
+    /// <param name="style">Цвета и текстовые атрибуты следующего участка текста.</param>
+    /// <remarks>
+    /// <para>
+    /// Сначала добавляет SGR 0, поэтому выключенные флаги и цвета не наследуются от предыдущего участка. Затем
+    /// добавляет включённые атрибуты и цвета.
+    /// </para>
+    /// <para>
+    /// Если включены оба флага мигания, в команде используется только быстрое. Структура Style не изменяется. Поддержка
+    /// отображения конкретных атрибутов зависит от терминала.
+    /// </para>
+    /// </remarks>
+    private static void WriteStyle(Style style)
+    {
+        //Полный сброс снимает и старые флаги, и прежние цвета перед установкой нового стиля.
+        WriteSgr(0);
+
+        //Каждый включённый флаг добавляет свою SGR-команду; SGR задаёт графическое оформление.
+        if (style.Has(StyleFlags.Bold)) WriteSgr(1);
+        if (style.Has(StyleFlags.Dim)) WriteSgr(2);
+        if (style.Has(StyleFlags.Italic)) WriteSgr(3);
+        if (style.Has(StyleFlags.Underline)) WriteSgr(4);
+        if (style.Has(StyleFlags.Strikethrough)) WriteSgr(9);
+        if (style.Has(StyleFlags.Overline)) WriteSgr(53);
+        if (style.Has(StyleFlags.Invert)) WriteSgr(7);
+        if (style.Has(StyleFlags.Conceal)) WriteSgr(8);
+
+        //Два флага могут храниться вместе, но для вывода выбираем один режим мигания.
+        if (style.Has(StyleFlags.RapidBlink)) WriteSgr(6);
+        else if (style.Has(StyleFlags.Blink)) WriteSgr(5);
+
+        //При выключенном цвете достаточно уже добавленного сброса; иначе кодируем индекс или RGB.
+        if (style.Has(StyleFlags.FgEnabled))
+            WriteColor(true, style.Has(StyleFlags.FgTrueColor), style.FgR, style.FgG, style.FgB);
+
+        //Фон задаётся независимо от текста тем же способом.
+        if (style.Has(StyleFlags.BgEnabled))
+            WriteColor(false, style.Has(StyleFlags.BgTrueColor), style.BgR, style.BgG, style.BgB);
+    }
+
+    /// <summary>
+    /// Добавляет одну SGR-команду настройки графического оформления.
+    /// </summary>
+    /// <param name="code">Числовой параметр между префиксом ESC[ и завершающим m.</param>
+    /// <remarks>
+    /// <para>
+    /// Метод записывает только байты команды и не изменяет сохранённые стили ячеек.
+    /// </para>
+    /// </remarks>
+    private static void WriteSgr(int code)
+    {
+        //Префикс управляющей последовательности.
+        _renderBuffer.Write("\x1b["u8);
+
+        //Число записывается десятичными байтами, без построения строки.
+        WriteNumber(code);
+
+        //Буква m завершает SGR-команду.
+        _renderBuffer.Write("m"u8);
+    }
+
+    /// <summary>
+    /// Добавляет команду индексированного или полноцветного цвета текста либо фона.
+    /// </summary>
+    /// <param name="foreground">
+    /// <see langword="true"/> — цвет текста (38); <see langword="false"/> — цвет фона (48).
+    /// </param>
+    /// <param name="trueColor">
+    /// <see langword="true"/> — RGB с параметром 2; <see langword="false"/> — индексированная палитра с параметром 5.
+    /// </param>
+    /// <param name="r">Красная компонента либо индекс палитры.</param>
+    /// <param name="g">Зелёная компонента; в индексированном режиме не используется.</param>
+    /// <param name="b">Синяя компонента; в индексированном режиме не используется.</param>
+    private static void WriteColor(bool foreground, bool trueColor, byte r, byte g, byte b)
+    {
+        //Параметр 38 задаёт текст, 48 — фон.
+        if (foreground)
+            _renderBuffer.Write("\x1b[38;"u8);
+        else
+            _renderBuffer.Write("\x1b[48;"u8);
+
+        //Формат полноцветного параметра: 2;r;g;b.
+        if (trueColor)
+        {
+            _renderBuffer.Write("2;"u8);
+            WriteNumber(r);
+            _renderBuffer.Write(";"u8);
+            WriteNumber(g);
+            _renderBuffer.Write(";"u8);
+            WriteNumber(b);
+        }
+        //Формат индексированного параметра: 5;index. Индекс хранится в соответствующем поле R.
+        else
+        {
+            _renderBuffer.Write("5;"u8);
+            WriteNumber(r);
+        }
+
+        //Закрываем выбранную команду цвета байтом m.
+        _renderBuffer.Write("m"u8);
+    }
+
+    /// <summary>
+    /// Кодирует символ ячейки в UTF-8 и дописывает его байты в команду.
+    /// </summary>
+    /// <param name="character">Символ ячейки для отображения.</param>
+    /// <remarks>
+    /// <para>
+    /// Управляющие символы, включая нулевой, и отдельные суррогатные кодовые единицы заменяются пробелом. Это не меняет
+    /// содержимое исходной ячейки.
+    /// </para>
+    /// <para>
+    /// Ширина символа на экране здесь не вычисляется. Алгоритм рассчитан на поддерживаемые символы, занимающие один
+    /// столбец.
+    /// </para>
+    /// </remarks>
+    private static void WriteCharacter(char character)
+    {
+        //Не даём содержимому ячейки выполнять управляющие действия; неподдерживаемый char станет пробелом.
+        if (char.IsControl(character) || char.IsSurrogate(character))
+            character = ' ';
+
+        //Явная проверка нулевого char; он уже относится к управляющим символам в проверке выше.
+        if (character == '\0')
+            character = ' ';
+
+        //Rune хранит допустимое скалярное значение Unicode; суррогаты выше уже заменены.
+        Rune rune = new(character);
+
+        //GetSpan предоставляет свободную память, Advance учитывает только реально записанные байты.
+        int length = rune.EncodeToUtf8(_renderBuffer.GetSpan(4));
+        _renderBuffer.Advance(length);
+    }
+
+    #endregion
+
+    //2. Страницы: создание по ключу и выбор получателя событий.
+
+    #region Pages
+
+    //Объекты страниц живут независимо от текущего выбора и не очищаются при Stop().
+    private static readonly ConcurrentDictionary<string, Page> _pages = new();
+
+    //Ключ выбранной страницы; пустой ключ изначально не создаёт страницу автоматически.
+    private static volatile string _currentPage = string.Empty;
+
+    /// <summary>
+    /// Возвращает ключ, сохранённый как текущая страница.
+    /// </summary>
+    /// <value>
+    /// Изначально пустая строка; сам ключ не гарантирует существование страницы.
+    /// </value>
+    /// <remarks>
+    /// <para>
+    /// При выборе несуществующего ключа страничные события не вызываются, но глобальные продолжают работать.
+    /// </para>
+    /// </remarks>
+    public static string CurrentPage => _currentPage;
+
+    /// <summary>
+    /// Возвращает страницу по ключу, создавая её при первом обращении.
+    /// </summary>
+    /// <param name="key">Ключ страницы в словаре.</param>
+    /// <returns>
+    /// Существующий или впервые созданный объект страницы.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Получение страницы не делает её текущей. Для выбора используется <see cref="SelectPage"/>. Страницы и их
+    /// накопленный ввод сохраняются между запусками терминала.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> равен <see langword="null"/>.</exception>
+    public static Page Page(string key)
+    {
+        return _pages.GetOrAdd(key, _ => new Page());
+    }
+
+    /// <summary>
+    /// Сохраняет ключ страницы для последующих операций ввода и вывода.
+    /// </summary>
+    /// <param name="key">Ключ желаемой страницы.</param>
+    /// <remarks>
+    /// <para>
+    /// Метод не создаёт страницу, не проверяет наличие ключа и не очищает ввод. Для создания сначала используйте
+    /// <see cref="Page(string)"/>.
+    /// </para>
+    /// <para>
+    /// Страница для уже начатой обработки клавиши выбрана заранее и не заменяется этим вызовом. Последующие операции
+    /// определяют текущую страницу заново.
+    /// </para>
+    /// </remarks>
+    public static void SelectPage(string key)
+    {
+        _currentPage = key;
+    }
+
+    #endregion
+
 }

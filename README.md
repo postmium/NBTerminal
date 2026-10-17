@@ -1,97 +1,243 @@
 # NBTerminal
 
-**NBTerminal (Non-Blocking Terminal)** is a lightweight, event-driven terminal library for C# and .NET. It provides keyboard input through events and independently controlled, automatically refreshed console output.
+**NBTerminal (Non-Blocking Terminal)** is a lightweight, event-driven library for building interactive console applications in **C# and .NET**.
 
-The library is intended for small interactive console applications, command-line tools, and text-based interfaces without requiring a full terminal UI framework.
+It runs keyboard processing and screen updates in a background task, so the calling code does not have to manage a blocking input loop or manually repaint the console. Your application handles events and writes to a virtual screen; NBTerminal takes care of rendering the result.
+
+NBTerminal focuses on a small API, predictable behavior, and no third-party dependencies rather than providing a complete collection of UI widgets.
 
 ## Features
 
-- **Non-blocking startup:** run keyboard input on a background task without blocking the calling code.
-- **Independent input and output:** start and stop either subsystem separately or together.
-- **Event-driven input:** handle keys, characters, and completed lines through C# events.
-- **Automatic rendering:** build a frame with `Write()` and `WriteLine()`; only changed lines are redrawn.
-- **Pages:** register pages with their own input events, output handlers, and text buffers.
-- **Error reporting:** subscribe to `Terminal.Error` or inspect `Terminal.LastError`.
-- **No third-party dependencies.**
+- **Event-driven keyboard input:** receive keys, printable characters, and completed lines through C# events.
+- **Independent input and output:** enable either subsystem, both, or neither while the main loop is running.
+- **Pages:** separate input state and event handlers for different views of your application.
+- **Virtual screen:** build a `Frame` with `Write()`, `WriteLine()`, `Set()`, and a virtual cursor.
+- **Styled text:** use fluent text formatting, 256-color palettes, and 24-bit RGB foreground/background colors.
+- **Efficient updates:** reuse two frame buffers, compare their cells, and redraw only rows that changed.
+- **Terminal control:** optional alternate screen, hidden cursor during rendering, and UTF-8 output.
+- **Error reporting:** separate input, output, render, and fatal-loop exceptions.
+- **No external dependencies:** built with the standard .NET libraries.
 
 ## Requirements
 
-- .NET 10 or later (the current package targets `net10.0`).
-- An interactive console/terminal for keyboard input and dynamic rendering.
+- **.NET 10** (`net10.0`).
+- **Windows 10 or Windows 11** with an interactive VT/ANSI-compatible terminal. Windows Terminal is recommended.
+
+Other VT-compatible terminals may work, but cross-platform behavior has not been fully verified. Windows 7 and 8 are not supported. NBTerminal is designed for an interactive console, not for redirected terminal output to files or pipes.
 
 ## Installation
 
-Once NBTerminal is published to NuGet:
+Add a reference to the NBTerminal project from your solution (in Visual Studio or with the .NET CLI):
+
+```bash
+dotnet add reference ../NBTerminal/NBTerminal.csproj
+```
+
+Adjust the path to match your solution structure.
+
+If the package is published to NuGet, you can instead install it with:
 
 ```bash
 dotnet add package NBTerminal
 ```
 
-Or reference the `NBTerminal` project directly when building from source.
+## Quick start
 
-## Examples
-
-### 1. Keyboard input without blocking the main flow
+This example creates two pages: a counter controlled by the arrow keys and a text-input page. Press **F1** or **F2** to switch between them, and **Escape** to exit.
 
 ```csharp
 using NBTerminal;
 
-Console.WriteLine("Press any key. Escape to exit.");
+// Create pages and choose the initial page.
+Page counterPage = Terminal.Page("Counter");
+Page textPage = Terminal.Page("Text");
+Terminal.SelectPage("Counter");
+
+int counter = 0;
+string lastText = "(nothing submitted)";
+
+// Global shortcuts work regardless of the selected page.
+Terminal.InputReadKey += key =>
+{
+    switch (key.Key)
+    {
+        case ConsoleKey.F1:
+            Terminal.SelectPage("Counter");
+            break;
+
+        case ConsoleKey.F2:
+            Terminal.SelectPage("Text");
+            break;
+
+        case ConsoleKey.Escape:
+            Terminal.Stop();
+            break;
+    }
+};
+
+// Each page can handle its own keyboard input.
+counterPage.InputReadKey += key =>
+{
+    if (key.Key == ConsoleKey.UpArrow) counter++;
+    if (key.Key == ConsoleKey.DownArrow) counter--;
+};
+
+textPage.InputReadLine += line =>
+{
+    lastText = line;
+};
+
+// A page receives a fresh (or cleared and reused) frame on each update.
+counterPage.Output += frame =>
+{
+    frame.WriteLine("NBTerminal 0.2.0".Bold().FgColor(80, 180, 255));
+    frame.WriteLine("F1: Counter | F2: Text | Esc: Exit");
+    frame.WriteLine();
+    frame.WriteLine($"Counter: {counter}".FgColor(100, 255, 140));
+    frame.WriteLine("Use Up / Down to change the value.");
+};
+
+textPage.Output += frame =>
+{
+    frame.WriteLine("NBTerminal 0.2.0".Bold().FgColor(80, 180, 255));
+    frame.WriteLine("F1: Counter | F2: Text | Esc: Exit");
+    frame.WriteLine();
+    frame.WriteLine("Type something and press Enter.");
+    frame.WriteLine($"Current input: {textPage.InputString}".FgColor(255, 220, 100));
+    frame.WriteLine($"Last submitted: {lastText}");
+};
+
+// Input and output must be enabled explicitly.
+Terminal.InputEnabled = true;
+Terminal.OutputEnabled = true;
+
+Terminal.Start(); // Starts the background loop and returns immediately.
+Terminal.Wait();  // Wait only from the application's controlling code.
+
+// The renderer has released the console by this point.
+if (Terminal.MainException is { } error)
+    Console.Error.WriteLine(error);
+```
+
+`Terminal.Page(key)` creates a page on first access or returns the existing one. `Terminal.SelectPage(key)` changes the active page without resetting its pending input.
+
+### Input-only mode
+
+You can use NBTerminal to handle keyboard input without taking control of the screen. In this mode, ordinary `Console.WriteLine()` calls are available:
+
+```csharp
+using NBTerminal;
 
 Terminal.InputReadKey += key =>
 {
     if (key.Key == ConsoleKey.Escape)
-        Terminal.StopInputRequest();
+        Terminal.Stop();
     else
         Console.WriteLine($"Pressed: {key.Key}");
 };
 
-Terminal.StartInput();
+Terminal.InputEnabled = true;
+Terminal.OutputEnabled = false;
 
-while (Terminal.InputEnabled)
-    await Task.Delay(50);
-
-await Terminal.StopInputAsync();
+Console.WriteLine("Press keys; Escape exits.");
+Terminal.Start();
+Terminal.Wait();
 ```
 
-Here, NBTerminal handles keyboard polling. Standard `Console.WriteLine()` remains available because the rendering subsystem is not running.
+### Working with frames and styles
 
-### 2. Automatically updated console output
+`Frame` is a virtual screen made up of `Cell` values. Every cell stores a `char` and its `Style`. Writing to a frame does **not** write directly to the console; the renderer processes the completed frame after the output handlers return.
 
 ```csharp
-using NBTerminal;
-
 Terminal.Output += frame =>
 {
-    frame.WriteLine("NBTerminal");
-    frame.WriteLine($"Current time: {DateTime.Now:HH:mm:ss}");
+    frame.WriteLine("Regular text");
+    frame.WriteLine("Bold and underlined".Bold().Underline());
+    frame.WriteLine("RGB foreground and background".FgColor(255, 220, 80).BgColor(40, 40, 100));
+    frame.WriteLine("256-color palette".FgColor((byte)46));
+
+    if (frame.Width > 0 && frame.Height > 0)
+        frame.Set(frame.Width - 1, frame.Height - 1, new Cell('#', default));
 };
-
-Terminal.StartOutput();
-
-await Task.Delay(TimeSpan.FromSeconds(10));
-
-await Terminal.StopOutputAsync();
 ```
 
-The output handler is called repeatedly. NBTerminal compares frames and updates only lines that changed.
+Other available styles include italic, dim, strikethrough, overline, blinking, inverted colors, and concealed text. Whether a visual attribute is supported depends on the terminal.
 
-For an application that uses both input and output, call `Terminal.Start()` and stop it with `Terminal.StopRequest()` followed by `await Terminal.StopAsync()`.
+`Frame.SetCursorPosition(x, y)` moves the **virtual** writing cursor. Writing wraps at the right edge and stops beyond the bottom edge; it does not scroll. Direct `Set()` calls replace individual cells and ignore out-of-range coordinates.
 
-See [`NBTerminal.Example`](NBTerminal.Example/) for a runnable example project.
+## How it works
 
-## Important notes
+Each iteration of the background loop performs these operations sequentially:
 
-- Input and output handlers run on background tasks. Synchronize application data accessed by both when necessary.
-- Input is **not echoed automatically**. Use the `InputRead`, `InputReadLine`, and `InputReadKey` events to handle it.
-- When `StartOutput()` is active, avoid writing directly to `Console`: doing so can interfere with the renderer.
-- Register pages before starting the terminal. Concurrent changes to the page collection are not supported.
-- The renderer is text-based and does not yet fully handle ANSI formatting or all Unicode character widths. Resizing the terminal may produce recoverable errors.
-- Cross-platform terminal compatibility has not yet been fully tested.
+1. Read available keyboard input and invoke input handlers, if enabled.
+2. Start or stop control of the terminal screen when `OutputEnabled` changes.
+3. Build a frame by invoking the selected page's `Output` handlers, then the global `Terminal.Output` handlers.
+4. Compare the new frame against the last rendered frame and send only changed rows to the terminal.
+5. Wait approximately 10 ms before the next iteration (in addition to the time spent processing events and output).
+
+Two `Frame` instances are reused while the terminal dimensions remain unchanged. Rendering uses VT/ANSI control sequences and UTF-8 bytes sent to standard output. A size change or a new rendering session triggers a full redraw.
+
+The library uses **one logical background loop**, not separate concurrent input and output loops. Event handlers run sequentially within that loop and should complete synchronously.
+
+## Lifecycle and configuration
+
+| API | Purpose |
+| --- | --- |
+| `Terminal.InputEnabled` | Enable or disable keyboard processing. |
+| `Terminal.OutputEnabled` | Enable or disable screen rendering. |
+| `Terminal.UseAlternateScreen` | Choose whether the *next* terminal session uses the alternate screen (default: `true`). |
+| `Terminal.Start()` | Start the background loop without waiting for it to finish. |
+| `Terminal.StartAsync()` | Asynchronously initiate/restart the loop; does not wait for its entire lifetime. |
+| `Terminal.Stop()` | Request the loop to stop without waiting. Safe to call from event handlers. |
+| `Terminal.Wait()` / `Terminal.WaitAsync()` | Wait for the current loop to finish without propagating its stored exception. |
+| `Terminal.StopAsync()` | Request termination and asynchronously wait for cleanup. |
+| `Terminal.Enabled` | Whether the loop is currently marked as running. |
+
+**Important:** call waiting methods from your application's controlling code, not synchronously from a terminal event handler. Waiting for the current loop from one of its own handlers can cause a deadlock. Use `Terminal.Stop()` inside handlers and `Terminal.Wait()` or `Terminal.WaitAsync()` outside them.
+
+Changing `OutputEnabled` is a request: initialization and cleanup take place on the next loop iteration, not immediately in the property setter. Changing `UseAlternateScreen` during a session takes effect only after stopping and starting the terminal again.
+
+When output is active, avoid `Console.Write()` and `Console.WriteLine()` in other code: they are not coordinated with the renderer and can corrupt the displayed image.
+
+## Error handling
+
+NBTerminal records the latest error in each subsystem and exposes a corresponding event:
+
+| Property | Event | Behavior |
+| --- | --- | --- |
+| `Terminal.InputException` | `Terminal.InputError` | A user input-handler failure is reported and the loop continues. Console input failures may disable input. |
+| `Terminal.OutputException` | `Terminal.OutputError` | A frame-building failure is reported; that frame is skipped and later frames may still render. |
+| `Terminal.RenderException` | `Terminal.RenderError` | A rendering failure is reported and output is disabled to prevent repeated failures. |
+| `Terminal.MainException` | — | Contains a fatal loop error, including an exception thrown by an error-event handler. |
+
+For example:
+
+```csharp
+Exception? lastInputError = null;
+Exception? lastOutputError = null;
+
+Terminal.InputError += error => lastInputError = error;
+Terminal.OutputError += error => lastOutputError = error;
+
+// Inspect Terminal.MainException after Terminal.Wait().
+```
+
+Errors inside `InputError`, `OutputError`, or `RenderError` handlers are fatal to the main loop. The waiting helpers do not rethrow loop errors; inspect `Terminal.MainException` after waiting. `Terminal.MainTask` remains available if you need to inspect the underlying task yourself.
+
+## Limitations and design notes
+
+- **Not fully thread-safe.** Treat terminal events and frame building as a single sequential workflow. Concurrent access to application state needs coordination by the application.
+- **One process-wide terminal instance.** `Terminal` is a static class with shared state.
+- **No automatic input echo.** Use `InputReadKey`, `InputRead`, and `InputReadLine` or the page-specific events to display entered text.
+- **No automatic scrolling.** `Frame.Write()` stops when it runs past the bottom of the buffer.
+- **Limited Unicode cell model.** Each cell stores a single `char`; wide characters, combining sequences, emoji represented by surrogate pairs, and grapheme-aware editing are not yet supported. Common one-column characters, including Cyrillic, are supported.
+- **Interactive terminals only.** Redirected output and legacy terminal behavior are outside the intended use case.
+- **No built-in widgets or layout engine.** Menus, windows, selection state, and other UI elements are built in the application's output handlers.
+- **Event subscriptions and page state persist** between `Start()` / `Stop()` sessions unless your application changes them.
 
 ## Contributing
 
-Bug reports, suggestions, and pull requests are welcome. You can open an issue or propose a change through GitHub.
+Issues, bug reports, ideas, and pull requests are welcome. Please include the .NET version, terminal application, operating system, and reproduction steps when reporting rendering problems.
 
 ## License
 
