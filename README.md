@@ -13,6 +13,7 @@ NBTerminal focuses on a small API, predictable behavior, and no third-party depe
 - **Pages:** separate input state and event handlers for different views of your application.
 - **Virtual screen:** build a `Frame` with `Write()`, `WriteLine()`, `Set()`, and a virtual cursor.
 - **Styled text:** use fluent text formatting, 256-color palettes, and 24-bit RGB foreground/background colors.
+- **Composite styled text:** combine multiple independently styled fragments using `StyledText`, including plain strings and `StyledString` values.
 - **Efficient updates:** reuse two frame buffers, compare their cells, and redraw only rows that changed.
 - **Terminal control:** optional alternate screen, hidden cursor during rendering, and UTF-8 output.
 - **Error reporting:** separate input, output, render, and fatal-loop exceptions.
@@ -27,19 +28,19 @@ Other VT-compatible terminals may work, but cross-platform behavior has not been
 
 ## Installation
 
-Add a reference to the NBTerminal project from your solution (in Visual Studio or with the .NET CLI):
+Install NBTerminal from NuGet:
+
+```bash
+dotnet add package NBTerminal --version 0.2.1
+```
+
+Alternatively, add a reference to the NBTerminal project from your solution (in Visual Studio or with the .NET CLI):
 
 ```bash
 dotnet add reference ../NBTerminal/NBTerminal.csproj
 ```
 
 Adjust the path to match your solution structure.
-
-If the package is published to NuGet, you can instead install it with:
-
-```bash
-dotnet add package NBTerminal
-```
 
 ## Quick start
 
@@ -55,6 +56,14 @@ Terminal.SelectPage("Counter");
 
 int counter = 0;
 string lastText = "(nothing submitted)";
+
+// Create styled text once and reuse it during rendering.
+StyledText formattingExample = new(
+    "Formatting: ",
+    "RGB".Bold().FgColor(255, 100, 100),
+    " and ",
+    "256-color palette".FgColor((byte)46).Underline()
+);
 
 // Global shortcuts work regardless of the selected page.
 Terminal.InputReadKey += key =>
@@ -90,16 +99,18 @@ textPage.InputReadLine += line =>
 // A page receives a fresh (or cleared and reused) frame on each update.
 counterPage.Output += frame =>
 {
-    frame.WriteLine("NBTerminal 0.2.0".Bold().FgColor(80, 180, 255));
+    frame.WriteLine("NBTerminal 0.2.1".Bold().FgColor(80, 180, 255));
     frame.WriteLine("F1: Counter | F2: Text | Esc: Exit");
     frame.WriteLine();
     frame.WriteLine($"Counter: {counter}".FgColor(100, 255, 140));
     frame.WriteLine("Use Up / Down to change the value.");
+    frame.WriteLine();
+    frame.WriteLine(formattingExample);
 };
 
 textPage.Output += frame =>
 {
-    frame.WriteLine("NBTerminal 0.2.0".Bold().FgColor(80, 180, 255));
+    frame.WriteLine("NBTerminal 0.2.1".Bold().FgColor(80, 180, 255));
     frame.WriteLine("F1: Counter | F2: Text | Esc: Exit");
     frame.WriteLine();
     frame.WriteLine("Type something and press Enter.");
@@ -164,6 +175,76 @@ Terminal.Output += frame =>
 Other available styles include italic, dim, strikethrough, overline, blinking, inverted colors, and concealed text. Whether a visual attribute is supported depends on the terminal.
 
 `Frame.SetCursorPosition(x, y)` moves the **virtual** writing cursor. Writing wraps at the right edge and stops beyond the bottom edge; it does not scroll. Direct `Set()` calls replace individual cells and ignore out-of-range coordinates.
+
+### Composite styled text
+
+Starting with **NBTerminal 0.2.1**, `StyledText` allows multiple `StyledString` fragments to be combined into a single text object.
+
+Unlike `StyledString`, which applies one style to its entire text, `StyledText` preserves the individual formatting of each fragment.
+
+```csharp
+StyledText text = new(
+    "Regular text, ",
+    "red text".FgColor(255, 0, 0),
+    " and ",
+    "bold green text".Bold().FgColor(0, 255, 0)
+);
+
+Terminal.Output += frame =>
+{
+    frame.WriteLine(text);
+};
+```
+
+Each fragment retains its own foreground color, background color, and text attributes.
+
+**Plain strings are supported.** `StyledString` provides an implicit conversion from `string`, allowing regular and styled strings to be mixed without explicit constructors.
+
+```csharp
+StyledText message = new(
+    "Health: ",
+    "75%".Bold().FgColor(0, 255, 0),
+    " | ",
+    "Warning!".Blink().FgColor(255, 191, 0)
+);
+```
+
+#### Writing StyledText to a frame
+
+`Frame` provides two overloads for composite styled text:
+
+- `Frame.Write(StyledText)` — writes all fragments sequentially at the current virtual cursor position.
+- `Frame.WriteLine(StyledText)` — writes all fragments and advances the virtual cursor to the next line.
+
+Each fragment is processed through the existing `StyledString` writing mechanism. Colors and attributes are preserved independently, and the virtual cursor continues advancing across fragment boundaries.
+
+#### Immutability and allocations
+
+`StyledText` is an immutable collection of `StyledString` values.
+
+- Fragments are copied into an internal array when the object is created.
+- Individual fragments cannot be modified through `StyledText`.
+- `StyledString` is a value type, so storing its values does not require a separate heap object for each fragment.
+- Existing `StyledText` instances can be reused across multiple frames.
+- Indexed iteration through fragments does not require allocating an enumerator.
+
+For frequently updated interfaces, create reusable `StyledText` objects **outside** output event handlers whenever their contents remain unchanged.
+
+```csharp
+StyledText title = new(
+    "NB".FgColor(0, 255, 0),
+    "Terminal".Bold().FgColor(80, 180, 255)
+);
+
+Terminal.Output += frame =>
+{
+    frame.WriteLine(title);
+};
+```
+
+This avoids rebuilding the collection of fragments on every screen update.
+
+`StyledText` handles text composition rather than layout. It does not automatically align text, create panels, or manage screen regions.
 
 ## How it works
 
@@ -234,6 +315,7 @@ Errors inside `InputError`, `OutputError`, or `RenderError` handlers are fatal t
 - **Interactive terminals only.** Redirected output and legacy terminal behavior are outside the intended use case.
 - **No built-in widgets or layout engine.** Menus, windows, selection state, and other UI elements are built in the application's output handlers.
 - **Event subscriptions and page state persist** between `Start()` / `Stop()` sessions unless your application changes them.
+- **Terminal-dependent text attributes.** Blinking and other visual effects may be ignored or rendered differently depending on the terminal emulator.
 
 ## Contributing
 

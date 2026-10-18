@@ -429,6 +429,18 @@ public class Frame
     }
 
     /// <summary>
+    /// Записывает последовательность стилизованных фрагментов в текущую позицию курсора.
+    /// </summary>
+    /// <param name="text">Текст для записи.</param>
+    public void Write(StyledText text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+
+        for (int i = 0; i < text.Count; i++)
+            Write(text[i]);
+    }
+
+    /// <summary>
     /// Записывает обычную строку и затем переходит к началу следующей.
     /// </summary>
     /// <param name="text">Текст; при <see langword="null"/> выполняется только переход строки.</param>
@@ -458,6 +470,16 @@ public class Frame
     {
         Write(text);
         NewLine();
+    }
+
+    /// <summary>
+    /// Записывает последовательность стилизованных фрагментов и переводит курсор на новую строку.
+    /// </summary>
+    /// <param name="text">Текст для записи.</param>
+    public void WriteLine(StyledText text)
+    {
+        Write(text);
+        WriteLine();
     }
 
     /// <summary>

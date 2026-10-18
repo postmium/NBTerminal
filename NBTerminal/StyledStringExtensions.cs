@@ -1,4 +1,4 @@
-﻿namespace NBTerminal;
+﻿namespace NBTerminal.Extensions;
 
 /// <summary>
 /// Создаёт стилизованные строки из обычного текста с помощью методов расширения.

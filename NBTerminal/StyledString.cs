@@ -383,4 +383,22 @@ public readonly record struct StyledString
     {
         return Text ?? string.Empty;
     }
+
+    /// <summary>
+    /// Неявно преобразует обычную строку в стилизованную строку с оформлением по умолчанию.
+    /// </summary>
+    /// <param name="value">Исходный текст.</param>
+    /// <returns>
+    /// Новое значение <see cref="StyledString"/> с исходным текстом и оформлением по умолчанию.
+    /// </returns>
+    /// <remarks>
+    /// Преобразование выполняется автоматически, когда ожидается <see cref="StyledString"/>, а передано значение <see cref="string"/>.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="value"/> равен <see langword="null"/>.
+    /// </exception>
+    public static implicit operator StyledString(string value)
+    {
+        return new StyledString(value);
+    }
 }

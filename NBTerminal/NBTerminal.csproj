@@ -1,27 +1,26 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
-
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 
 		<PackageId>NBTerminal</PackageId>
-		<Version>0.2.0</Version>
+		<Version>0.2.1</Version>
 		<Title>NBTerminal</Title>
 		<Authors>postmium</Authors>
 
-		<Description>A lightweight, event-driven .NET terminal library with non-blocking input, independent rendering, and page management.</Description>
-
-		<PackageTags>terminal;console;non-blocking;event-driven;rendering</PackageTags>
+		<Description>A lightweight, event-driven .NET terminal library featuring non-blocking input, independent rendering, page management, and composable styled text.</Description>
+		<PackageTags>terminal;console;non-blocking;event-driven;rendering;styled-text</PackageTags>
 
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 
 		<RepositoryUrl>https://github.com/postmium/NBTerminal</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
+		<PackageProjectUrl>https://github.com/postmium/NBTerminal</PackageProjectUrl>
 
 		<PackageReadmeFile>README.md</PackageReadmeFile>
-
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 	</PropertyGroup>
 
 	<ItemGroup>
