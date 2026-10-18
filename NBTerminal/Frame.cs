@@ -351,7 +351,7 @@ public class Frame
     /// </remarks>
     public void Write(StyledString text)
     {
-        WriteText(text.Text.AsSpan(), text.Style);
+        WriteText(text.Text.AsSpan(), text.Style.Resolved());
     }
 
     /// <summary>
@@ -395,6 +395,10 @@ public class Frame
                 Write(styled);
                 break;
 
+            case StyledText styledText:
+                Write(styledText);
+                break;
+
             case string text:
                 Write(text);
                 break;
@@ -429,15 +433,16 @@ public class Frame
     }
 
     /// <summary>
-    /// Записывает последовательность стилизованных фрагментов в текущую позицию курсора.
+    /// Записывает составной стилизованный текст с поддержкой вложенности и наследования стилей.
     /// </summary>
-    /// <param name="text">Текст для записи.</param>
+    /// <param name="text">Составной текст для записи.</param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="text"/> равен <see langword="null"/>.
+    /// </exception>
     public void Write(StyledText text)
     {
         ArgumentNullException.ThrowIfNull(text);
-
-        for (int i = 0; i < text.Count; i++)
-            Write(text[i]);
+        WriteStyledText(text, default);
     }
 
     /// <summary>
@@ -495,6 +500,32 @@ public class Frame
     {
         Write(value);
         NewLine();
+    }
+
+    /// <summary>
+    /// Рекурсивно записывает составной текст с учётом стиля родительского элемента.
+    /// </summary>
+    /// <param name="text">Текущий элемент дерева.</param>
+    /// <param name="parentStyle">Унаследованное оформление.</param>
+    private void WriteStyledText(StyledText text, Style parentStyle)
+    {
+        Style style = Style.Merge(parentStyle, text.Style);
+
+        for (int i = 0; i < text.Count; i++)
+        {
+            StyledTextPart part = text[i];
+
+            if (part.Nested is { } nested)
+            {
+                WriteStyledText(nested, style);
+            }
+            else
+            {
+                StyledString fragment = part.String;
+                Style finalStyle = Style.Merge(style, fragment.Style);
+                WriteText(fragment.Text.AsSpan(), finalStyle.Resolved());
+            }
+        }
     }
 
     /// <summary>

@@ -6,7 +6,7 @@
 		<Nullable>enable</Nullable>
 
 		<PackageId>NBTerminal</PackageId>
-		<Version>0.2.1</Version>
+		<Version>0.2.2</Version>
 		<Title>NBTerminal</Title>
 		<Authors>postmium</Authors>
 

@@ -23,6 +23,11 @@
 /// </remarks>
 public readonly record struct Style
 {
+    /// <summary>
+    /// Определяет свойства, явно установленные в данном стиле.
+    /// </summary>
+    internal StyleFlags Defined { get; private init; }
+
     //Цвет текста: R используется и для красной компоненты, и для индекса палитры.
 
     /// <summary>
@@ -146,7 +151,11 @@ public readonly record struct Style
     /// </returns>
     internal Style Set(StyleFlags flags, bool enabled)
     {
-        return enabled ? Add(flags) : Remove(flags);
+        return this with
+        {
+            Flags = enabled ? Flags | flags : Flags & ~flags,
+            Defined = Defined | flags
+        };
     }
 
     /// <summary>
@@ -177,14 +186,28 @@ public readonly record struct Style
     //Сброс оформления: полный либо только текстовых атрибутов.
 
     /// <summary>
-    /// Возвращает оформление по умолчанию, сбрасывая цвета и текстовые атрибуты.
+    /// Сбрасывает цвета текста и фона, а также все текстовые атрибуты.
     /// </summary>
     /// <returns>
-    /// <c>default(Style)</c> с нулевыми цветовыми полями и флагами.
+    /// Новое значение стиля без включённых цветов и текстовых атрибутов.
+    /// Все свойства помечаются как явно заданные для переопределения унаследованного оформления.
     /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Метод возвращает новый стиль, не изменяя исходное значение.
+    /// </para>
+    /// <para>
+    /// В отличие от <c>default(Style)</c>, возвращаемое значение содержит маску
+    /// <c>Defined</c>, которая позволяет отменять оформление родительского
+    /// <see cref="StyledText"/> при наследовании стилей.
+    /// </para>
+    /// </remarks>
     public Style ClearStyles()
     {
-        return default;
+        return new Style
+        {
+            Defined = StyleFlags.FgEnabled | StyleFlags.BgEnabled | StyleFlags.TextMask
+        };
     }
 
     /// <summary>
@@ -195,7 +218,66 @@ public readonly record struct Style
     /// </returns>
     public Style ClearTextStyles()
     {
-        return Remove(StyleFlags.TextMask);
+        return this with
+        {
+            Flags = Flags & ~StyleFlags.TextMask,
+            Defined = Defined | StyleFlags.TextMask
+        };
+    }
+
+    /// <summary>
+    /// Объединяет родительский и дочерний стили.
+    /// Явно заданные свойства дочернего стиля имеют приоритет.
+    /// </summary>
+    internal static Style Merge(Style parent, Style child)
+    {
+        StyleFlags textDefined = child.Defined & StyleFlags.TextMask;
+        StyleFlags flags = (parent.Flags & ~textDefined) | (child.Flags & textDefined);
+        StyleFlags defined = parent.Defined | child.Defined;
+
+        byte fgR = parent.FgR;
+        byte fgG = parent.FgG;
+        byte fgB = parent.FgB;
+
+        byte bgR = parent.BgR;
+        byte bgG = parent.BgG;
+        byte bgB = parent.BgB;
+
+        if ((child.Defined & StyleFlags.FgEnabled) != 0)
+        {
+            flags = (flags & ~StyleFlags.FgMask) | (child.Flags & StyleFlags.FgMask);
+            fgR = child.FgR;
+            fgG = child.FgG;
+            fgB = child.FgB;
+        }
+
+        if ((child.Defined & StyleFlags.BgEnabled) != 0)
+        {
+            flags = (flags & ~StyleFlags.BgMask) | (child.Flags & StyleFlags.BgMask);
+            bgR = child.BgR;
+            bgG = child.BgG;
+            bgB = child.BgB;
+        }
+
+        return new Style
+        {
+            FgR = fgR,
+            FgG = fgG,
+            FgB = fgB,
+            BgR = bgR,
+            BgG = bgG,
+            BgB = bgB,
+            Flags = flags,
+            Defined = defined
+        };
+    }
+
+    /// <summary>
+    /// Возвращает стиль без метаданных наследования для записи в кадр.
+    /// </summary>
+    internal Style Resolved()
+    {
+        return this with { Defined = 0 };
     }
 
     //Настройка текстовых атрибутов: каждый метод возвращает новый Style.
@@ -329,7 +411,8 @@ public readonly record struct Style
             FgR = 0,
             FgG = 0,
             FgB = 0,
-            Flags = Flags & ~StyleFlags.FgMask
+            Flags = Flags & ~StyleFlags.FgMask,
+            Defined = Defined | StyleFlags.FgEnabled
         };
     }
 
@@ -353,7 +436,8 @@ public readonly record struct Style
             FgR = index,
             FgG = 0,
             FgB = 0,
-            Flags = (Flags & ~StyleFlags.FgMask) | StyleFlags.FgEnabled
+            Flags = (Flags & ~StyleFlags.FgMask) | StyleFlags.FgEnabled,
+            Defined = Defined | StyleFlags.FgEnabled
         };
     }
 
@@ -379,7 +463,8 @@ public readonly record struct Style
             FgR = r,
             FgG = g,
             FgB = b,
-            Flags = (Flags & ~StyleFlags.FgMask) | StyleFlags.FgEnabled | StyleFlags.FgTrueColor
+            Flags = (Flags & ~StyleFlags.FgMask) | StyleFlags.FgEnabled | StyleFlags.FgTrueColor,
+            Defined = Defined | StyleFlags.FgEnabled
         };
     }
 
@@ -404,7 +489,8 @@ public readonly record struct Style
             BgR = 0,
             BgG = 0,
             BgB = 0,
-            Flags = Flags & ~StyleFlags.BgMask
+            Flags = Flags & ~StyleFlags.BgMask,
+            Defined = Defined | StyleFlags.BgEnabled
         };
     }
 
@@ -428,7 +514,8 @@ public readonly record struct Style
             BgR = index,
             BgG = 0,
             BgB = 0,
-            Flags = (Flags & ~StyleFlags.BgMask) | StyleFlags.BgEnabled
+            Flags = (Flags & ~StyleFlags.BgMask) | StyleFlags.BgEnabled,
+            Defined = Defined | StyleFlags.BgEnabled
         };
     }
 
@@ -454,7 +541,8 @@ public readonly record struct Style
             BgR = r,
             BgG = g,
             BgB = b,
-            Flags = (Flags & ~StyleFlags.BgMask) | StyleFlags.BgEnabled | StyleFlags.BgTrueColor
+            Flags = (Flags & ~StyleFlags.BgMask) | StyleFlags.BgEnabled | StyleFlags.BgTrueColor,
+            Defined = Defined | StyleFlags.BgEnabled
         };
     }
 }

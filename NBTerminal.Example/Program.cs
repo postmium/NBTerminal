@@ -1,7 +1,8 @@
 ﻿using NBTerminal;
 using NBTerminal.Extensions;
 
-//Пример NBTerminal 0.2.1: две страницы, события клавиатуры и стилизованный вывод.
+
+//Пример NBTerminal 0.2.2: две страницы, события клавиатуры и стилизованный вывод.
 //F1 — счётчик, F2 — ввод текста, Escape — завершение приложения.
 
 //Создаём страницы. Page(key) возвращает существующую страницу или создаёт новую.
@@ -111,7 +112,7 @@ Terminal.Output += frame =>
         return;
     }
 
-    frame.WriteLine("NBTerminal 0.2.1 — пример использования".Bold().FgColor(80, 180, 255));
+    frame.WriteLine("NBTerminal 0.2.2 — пример использования".Bold().FgColor(80, 180, 255));
     frame.WriteLine();
     frame.WriteLine("F1 — счётчик | F2 — ввод текста | Esc — выход");
     frame.WriteLine($"Текущая страница: {Terminal.CurrentPage}");

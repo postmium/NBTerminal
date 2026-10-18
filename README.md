@@ -12,8 +12,8 @@ NBTerminal focuses on a small API, predictable behavior, and no third-party depe
 - **Independent input and output:** enable either subsystem, both, or neither while the main loop is running.
 - **Pages:** separate input state and event handlers for different views of your application.
 - **Virtual screen:** build a `Frame` with `Write()`, `WriteLine()`, `Set()`, and a virtual cursor.
-- **Styled text:** use fluent text formatting, 256-color palettes, and 24-bit RGB foreground/background colors.
-- **Composite styled text:** combine multiple independently styled fragments using `StyledText`, including plain strings and `StyledString` values.
+- **Styled strings:** format regular `string` values with extension methods from `NBTerminal.Extensions`, including text attributes, 256-color palettes, and 24-bit RGB foreground/background colors.
+- **Nested styled text:** compose `string`, `StyledString`, and nested `StyledText` elements into reusable trees with inherited styles and explicit child overrides.
 - **Efficient updates:** reuse two frame buffers, compare their cells, and redraw only rows that changed.
 - **Terminal control:** optional alternate screen, hidden cursor during rendering, and UTF-8 output.
 - **Error reporting:** separate input, output, render, and fatal-loop exceptions.
@@ -31,7 +31,7 @@ Other VT-compatible terminals may work, but cross-platform behavior has not been
 Install NBTerminal from NuGet:
 
 ```bash
-dotnet add package NBTerminal --version 0.2.1
+dotnet add package NBTerminal
 ```
 
 Alternatively, add a reference to the NBTerminal project from your solution (in Visual Studio or with the .NET CLI):
@@ -40,7 +40,7 @@ Alternatively, add a reference to the NBTerminal project from your solution (in 
 dotnet add reference ../NBTerminal/NBTerminal.csproj
 ```
 
-Adjust the path to match your solution structure.
+Adjust the path to match your solution structure. The examples below describe the **0.2.2 API**; when using NuGet, make sure the installed package version supports nested `StyledText`.
 
 ## Quick start
 
@@ -48,6 +48,7 @@ This example creates two pages: a counter controlled by the arrow keys and a tex
 
 ```csharp
 using NBTerminal;
+using NBTerminal.Extensions;
 
 // Create pages and choose the initial page.
 Page counterPage = Terminal.Page("Counter");
@@ -99,7 +100,7 @@ textPage.InputReadLine += line =>
 // A page receives a fresh (or cleared and reused) frame on each update.
 counterPage.Output += frame =>
 {
-    frame.WriteLine("NBTerminal 0.2.1".Bold().FgColor(80, 180, 255));
+    frame.WriteLine("NBTerminal 0.2.2".Bold().FgColor(80, 180, 255));
     frame.WriteLine("F1: Counter | F2: Text | Esc: Exit");
     frame.WriteLine();
     frame.WriteLine($"Counter: {counter}".FgColor(100, 255, 140));
@@ -110,7 +111,7 @@ counterPage.Output += frame =>
 
 textPage.Output += frame =>
 {
-    frame.WriteLine("NBTerminal 0.2.1".Bold().FgColor(80, 180, 255));
+    frame.WriteLine("NBTerminal 0.2.2".Bold().FgColor(80, 180, 255));
     frame.WriteLine("F1: Counter | F2: Text | Esc: Exit");
     frame.WriteLine();
     frame.WriteLine("Type something and press Enter.");
@@ -157,6 +158,13 @@ Terminal.Wait();
 
 ### Working with frames and styles
 
+For style methods on plain strings (for example, `"Text".Bold()` or `"Text".FgColor(...)`), import **`NBTerminal.Extensions`**. After conversion, `StyledString` and `StyledText` provide their own style methods without an additional extension namespace.
+
+```csharp
+using NBTerminal;
+using NBTerminal.Extensions;
+```
+
 `Frame` is a virtual screen made up of `Cell` values. Every cell stores a `char` and its `Style`. Writing to a frame does **not** write directly to the console; the renderer processes the completed frame after the output handlers return.
 
 ```csharp
@@ -176,75 +184,95 @@ Other available styles include italic, dim, strikethrough, overline, blinking, i
 
 `Frame.SetCursorPosition(x, y)` moves the **virtual** writing cursor. Writing wraps at the right edge and stops beyond the bottom edge; it does not scroll. Direct `Set()` calls replace individual cells and ignore out-of-range coordinates.
 
-### Composite styled text
+### Composite styled text and inheritance
 
-Starting with **NBTerminal 0.2.1**, `StyledText` allows multiple `StyledString` fragments to be combined into a single text object.
-
-Unlike `StyledString`, which applies one style to its entire text, `StyledText` preserves the individual formatting of each fragment.
+`StyledString` holds text with one style. `StyledText` composes an ordered sequence of **plain strings**, **`StyledString` values**, and **other `StyledText` instances**. Each `StyledText` also has its own style, which serves as a default for its descendants.
 
 ```csharp
-StyledText text = new(
-    "Regular text, ",
-    "red text".FgColor(255, 0, 0),
-    " and ",
-    "bold green text".Bold().FgColor(0, 255, 0)
-);
+using NBTerminal;
+using NBTerminal.Extensions;
 
-Terminal.Output += frame =>
-{
-    frame.WriteLine(text);
-};
-```
-
-Each fragment retains its own foreground color, background color, and text attributes.
-
-**Plain strings are supported.** `StyledString` provides an implicit conversion from `string`, allowing regular and styled strings to be mixed without explicit constructors.
-
-```csharp
 StyledText message = new(
     "Health: ",
     "75%".Bold().FgColor(0, 255, 0),
     " | ",
     "Warning!".Blink().FgColor(255, 191, 0)
 );
+
+Terminal.Output += frame =>
+{
+    frame.WriteLine(message);
+};
 ```
 
-#### Writing StyledText to a frame
+**Inheritance rule:** a child inherits all properties not explicitly set on that child. Explicit child attributes and colors override the corresponding properties of its parent; unrelated parent properties remain in effect.
 
-`Frame` provides two overloads for composite styled text:
+```csharp
+StyledText notice = new(
+    "Inherited green | ",
+    "Red".FgColor(255, 0, 0),
+    " | ",
+    new StyledText(
+        "Bold green | ",
+        "Not bold".Bold(false),
+        " | Bold again"
+    ).Bold(),
+    " | Green again"
+).FgColor(0, 255, 0);
 
-- `Frame.Write(StyledText)` — writes all fragments sequentially at the current virtual cursor position.
-- `Frame.WriteLine(StyledText)` — writes all fragments and advances the virtual cursor to the next line.
+Terminal.Output += frame =>
+{
+    frame.WriteLine(notice);
+};
+```
 
-Each fragment is processed through the existing `StyledString` writing mechanism. Colors and attributes are preserved independently, and the virtual cursor continues advancing across fragment boundaries.
+In this example, the outer `StyledText` supplies a green foreground. The explicitly red fragment stays red. The nested group enables bold text for its contents, while `Bold(false)` explicitly disables bold for one fragment. The outer green color still applies to fragments without their own color.
 
-#### Immutability and allocations
-
-`StyledText` is an immutable collection of `StyledString` values.
-
-- Fragments are copied into an internal array when the object is created.
-- Individual fragments cannot be modified through `StyledText`.
-- `StyledString` is a value type, so storing its values does not require a separate heap object for each fragment.
-- Existing `StyledText` instances can be reused across multiple frames.
-- Indexed iteration through fragments does not require allocating an enumerator.
-
-For frequently updated interfaces, create reusable `StyledText` objects **outside** output event handlers whenever their contents remain unchanged.
+Style composition is recursive: a nested `StyledText` can inherit from its parent and set new defaults for its children. For example:
 
 ```csharp
 StyledText title = new(
+    "NB",
+    new StyledText("Terminal", "!").Bold().FgColor(80, 180, 255)
+).FgColor(0, 255, 0);
+```
+
+The `NB` fragment inherits green; the nested `Terminal!` group overrides its foreground with blue and enables bold. Style methods such as `Bold()`, `Underline()`, `FgColor()`, and `BgColor()` return new values rather than mutating existing elements.
+
+#### Explicit resets
+
+- `Bold(false)` (and corresponding attribute methods) explicitly disables an inherited attribute.
+- `FgDefault()` and `BgDefault()` explicitly override inherited colors with terminal defaults.
+- `ClearTextStyles()` clears text attributes at the current element, overriding inherited attributes while preserving colors.
+- `ClearStyles()` explicitly resets colors and text attributes at the current element. A more deeply nested element can still set its own values.
+
+#### Writing StyledText to a frame
+
+`Frame.Write(StyledText)` recursively visits the fragments at the current virtual cursor position, preserving their effective styles. `Frame.WriteLine(StyledText)` does the same and then advances to the next line. Existing newline, carriage-return, tab, wrapping, and frame-boundary behavior still applies. `Frame.Write(object?)` also recognizes `StyledText` instances.
+
+`StyledText` is a text-composition feature, **not** a layout engine. It does not position panels, align blocks, or automatically scroll content.
+
+#### Immutability and allocations
+
+`StyledText` stores its children in a private array. It copies the provided fragments at construction, but style methods return a new `StyledText` instance that shares the unchanged children array. The nested tree is therefore reusable without rebuilding every fragment. `StyledString` and `StyledTextPart` are value types; storing a fragment does not require boxing into `object`.
+
+Create static or seldom-changing styled texts **outside** output handlers and reuse them during frame updates:
+
+```csharp
+StyledText banner = new(
     "NB".FgColor(0, 255, 0),
-    "Terminal".Bold().FgColor(80, 180, 255)
+    new StyledText("Terminal").Bold().FgColor(80, 180, 255)
 );
 
 Terminal.Output += frame =>
 {
-    frame.WriteLine(title);
+    frame.WriteLine(banner);
 };
 ```
 
-This avoids rebuilding the collection of fragments on every screen update.
+The indexed traversal used by `Frame` does not require an enumerator allocation; recursive rendering uses the existing frame-writing logic. Building new styled-text trees or chaining style modifiers on every frame still creates objects and should be avoided when unnecessary.
 
-`StyledText` handles text composition rather than layout. It does not automatically align text, create panels, or manage screen regions.
+**API compatibility:** starting with nested-text support, `StyledText` exposes `IReadOnlyList<StyledTextPart>` rather than `IReadOnlyList<StyledString>`. Code that expects `StyledString` directly from `styledText[index]` must be adapted to examine the returned part's `String` or `Nested` member.
 
 ## How it works
 
